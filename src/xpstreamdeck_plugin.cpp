@@ -16,6 +16,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -76,6 +77,7 @@ struct Paths {
 struct ActionBinding {
     int keyIndex = -1;
     std::string commandPath;
+    std::string label;
     ActionMode mode = ActionMode::Once;
     XPLMCommandRef command = nullptr;
     bool active = false;
@@ -89,6 +91,7 @@ struct PendingKeyEvent {
 Prefs g_prefs;
 Paths g_paths;
 std::vector<ActionBinding> g_bindings;
+std::map<int, std::string> g_keyLabels;
 std::ofstream g_logFile;
 XPLMWindowID g_window = nullptr;
 XPLMMenuID g_menu = nullptr;
@@ -122,6 +125,85 @@ std::string sanitizeProfileName(std::string name) {
         }
     }
     return name;
+}
+
+std::string unescapeProfileText(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool escaping = false;
+    for (char ch : text) {
+        if (!escaping) {
+            if (ch == '\\') {
+                escaping = true;
+            } else {
+                out.push_back(ch);
+            }
+            continue;
+        }
+
+        switch (ch) {
+        case 'n':
+            out.push_back('\n');
+            break;
+        case '\\':
+            out.push_back('\\');
+            break;
+        default:
+            out.push_back(ch);
+            break;
+        }
+        escaping = false;
+    }
+    if (escaping) {
+        out.push_back('\\');
+    }
+    return out;
+}
+
+std::string defaultLabelFromCommandPath(const std::string& commandPath) {
+    if (commandPath.empty()) {
+        return {};
+    }
+
+    std::string tail = commandPath;
+    const auto slash = tail.find_last_of('/');
+    if (slash != std::string::npos && slash + 1 < tail.size()) {
+        tail = tail.substr(slash + 1);
+    }
+
+    for (char& ch : tail) {
+        if (ch == '_' || ch == '-') {
+            ch = ' ';
+        }
+    }
+
+    std::string cleaned;
+    cleaned.reserve(tail.size());
+    bool lastWasSpace = false;
+    for (unsigned char raw : tail) {
+        char ch = static_cast<char>(raw);
+        if (std::isspace(raw)) {
+            if (!cleaned.empty() && !lastWasSpace) {
+                cleaned.push_back(' ');
+                lastWasSpace = true;
+            }
+            continue;
+        }
+        lastWasSpace = false;
+        cleaned.push_back(static_cast<char>(std::toupper(raw)));
+    }
+
+    while (!cleaned.empty() && cleaned.back() == ' ') {
+        cleaned.pop_back();
+    }
+
+    if (cleaned.size() > 14) {
+        auto split = cleaned.find(' ');
+        if (split != std::string::npos && split < 8) {
+            return cleaned.substr(0, split) + "\n" + trimString(cleaned.substr(split + 1));
+        }
+    }
+    return cleaned;
 }
 
 std::string nowString() {
@@ -193,12 +275,18 @@ void writeDefaultProfileIfMissing() {
     }
     out
         << "# key.<index>=<command>|<mode>\n"
+        << "# label.<index>=TEXT or TEXT\\nTEXT\n"
         << "# mode: once | hold\n"
         << '\n'
+        << "label.0=PAUSE\n"
         << "key.0=sim/operation/pause_toggle|once\n"
+        << "label.1=FLAPS\\nDOWN\n"
         << "key.1=sim/flight_controls/flaps_down|once\n"
+        << "label.2=FLAPS\\nUP\n"
         << "key.2=sim/flight_controls/flaps_up|once\n"
+        << "label.3=BRAKES\n"
         << "key.3=sim/flight_controls/brakes_toggle_max|once\n"
+        << "label.4=REV\\nHOLD\n"
         << "key.4=sim/engines/thrust_reverse_hold|hold\n";
     logLine("created default profile: " + pathToDisplay(g_paths.activeProfileFile));
 }
@@ -326,6 +414,9 @@ void resolveBindings() {
     for (auto& binding : g_bindings) {
         binding.command = XPLMFindCommand(binding.commandPath.c_str());
         binding.active = false;
+        if (binding.label.empty()) {
+            binding.label = defaultLabelFromCommandPath(binding.commandPath);
+        }
         if (binding.command != nullptr) {
             ++g_resolvedBindings;
         } else {
@@ -341,6 +432,7 @@ void resolveBindings() {
 void loadProfile() {
     releaseHeldBindings();
     g_bindings.clear();
+    g_keyLabels.clear();
     writeDefaultProfileIfMissing();
 
     std::ifstream in(g_paths.activeProfileFile);
@@ -367,6 +459,20 @@ void loadProfile() {
         rhs = trimString(rhs);
 
         if (lhs.rfind("key.", 0) != 0) {
+            if (lhs.rfind("label.", 0) != 0) {
+                continue;
+            }
+
+            const std::string indexString = lhs.substr(6);
+            int keyIndex = -1;
+            try {
+                keyIndex = std::stoi(indexString);
+            } catch (...) {
+                logLine("invalid label index in profile: " + indexString);
+                continue;
+            }
+
+            g_keyLabels[keyIndex] = unescapeProfileText(rhs);
             continue;
         }
 
@@ -395,11 +501,62 @@ void loadProfile() {
         binding.keyIndex = keyIndex;
         binding.commandPath = commandPath;
         binding.mode = parseActionMode(modeRaw);
+        if (const auto labelIt = g_keyLabels.find(keyIndex); labelIt != g_keyLabels.end()) {
+            binding.label = labelIt->second;
+        }
         g_bindings.push_back(binding);
+    }
+
+    for (auto& binding : g_bindings) {
+        if (const auto labelIt = g_keyLabels.find(binding.keyIndex); labelIt != g_keyLabels.end()) {
+            binding.label = labelIt->second;
+        }
     }
 
     resolveBindings();
     logLine("active profile: " + g_prefs.activeProfile + " (" + pathToDisplay(g_paths.activeProfileFile) + ")");
+}
+
+std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
+    std::map<int, xpstreamdeck::StreamDeckKeyVisual> visuals;
+
+    for (const auto& [keyIndex, label] : g_keyLabels) {
+        auto& visual = visuals[keyIndex];
+        visual.key_index = keyIndex;
+        visual.label = label;
+        visual.has_binding = false;
+        visual.resolved = false;
+        visual.hold_mode = false;
+    }
+
+    for (const auto& binding : g_bindings) {
+        auto& visual = visuals[binding.keyIndex];
+        visual.key_index = binding.keyIndex;
+        visual.label = binding.label.empty() ? defaultLabelFromCommandPath(binding.commandPath) : binding.label;
+        visual.has_binding = true;
+        visual.resolved = binding.command != nullptr;
+        visual.hold_mode = binding.mode == ActionMode::Hold;
+    }
+
+    std::vector<xpstreamdeck::StreamDeckKeyVisual> ordered;
+    ordered.reserve(visuals.size());
+    for (const auto& [keyIndex, visual] : visuals) {
+        (void)keyIndex;
+        ordered.push_back(visual);
+    }
+    return ordered;
+}
+
+void refreshDeckKeyImages() {
+    const auto deck = g_deckBackend.currentDeck();
+    if (!deck.connected) {
+        return;
+    }
+
+    std::string errorMessage;
+    if (!g_deckBackend.applyKeyVisuals(buildDeckKeyVisuals(), &errorMessage) && !errorMessage.empty()) {
+        logLine(errorMessage);
+    }
 }
 
 void clearPendingKeyEvents() {
@@ -453,6 +610,7 @@ void startDeckBackend() {
     }
     g_statusLine = msg.str();
     logLine(g_statusLine);
+    refreshDeckKeyImages();
 }
 
 void reconfigureDeckBackend() {
@@ -666,6 +824,8 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     y -= step * 2;
     drawTextLine(x, y, "Profile syntax: key.<index>=<command>|<mode>");
     y -= step;
+    drawTextLine(x, y, "Label syntax: label.<index>=TEXT or TEXT\\nTEXT");
+    y -= step;
     drawTextLine(x, y, "Supported modes: once, hold");
 }
 
@@ -861,5 +1021,6 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFromWho, int inMessage, voi
     if (inMessage == XPLM_MSG_PLANE_LOADED && inParam == nullptr) {
         logLine("aircraft loaded, re-resolving profile commands");
         loadProfile();
+        refreshDeckKeyImages();
     }
 }

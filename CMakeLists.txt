@@ -98,11 +98,13 @@ else()
 endif()
 
 add_library(xpstreamdeck SHARED
+    src/key_label_renderer.cpp
     src/streamdeck_hid.cpp
     src/xpstreamdeck_plugin.cpp
 )
 configure_xplm_target(xpstreamdeck)
 target_link_libraries(xpstreamdeck PRIVATE hidapi_local)
+target_include_directories(xpstreamdeck PRIVATE "${CMAKE_SOURCE_DIR}/external/stb")
 
 if(APPLE)
     set_target_properties(xpstreamdeck PROPERTIES OUTPUT_NAME "mac")

@@ -2,9 +2,13 @@
 
 #include <hidapi.h>
 
+#include "key_label_renderer.h"
+
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 namespace xpstreamdeck {
@@ -15,6 +19,11 @@ constexpr unsigned short kElgatoVendorId = 0x0fd9;
 constexpr std::size_t kInputReportHeaderLength = 4;
 constexpr std::size_t kFeatureReportLength = 32;
 constexpr std::size_t kImageResetReportLength = 1024;
+constexpr std::size_t kKeyImageReportLength = 1024;
+constexpr std::size_t kKeyImageHeaderLength = 8;
+constexpr std::size_t kKeyImageChunkLength = kKeyImageReportLength - kKeyImageHeaderLength;
+constexpr int kKeyImageWidth = 72;
+constexpr int kKeyImageHeight = 72;
 constexpr int kReadTimeoutMs = 50;
 
 struct SupportedProduct {
@@ -52,6 +61,54 @@ void setBrightness(hid_device* device, int brightnessPercent) {
     payload[1] = 0x08;
     payload[2] = static_cast<unsigned char>(brightnessPercent);
     hid_send_feature_report(device, payload, sizeof(payload));
+}
+
+RgbColor backgroundForVisual(const StreamDeckKeyVisual& visual) {
+    if (!visual.has_binding) {
+        return {44, 48, 54};
+    }
+    if (!visual.resolved) {
+        return {112, 34, 34};
+    }
+    if (visual.hold_mode) {
+        return {133, 78, 24};
+    }
+    return {25, 61, 117};
+}
+
+bool writeKeyImage(hid_device* device, int keyIndex, const std::vector<unsigned char>& jpeg, std::string* errorMessage) {
+    std::size_t offset = 0;
+    std::uint16_t chunkIndex = 0;
+    while (offset < jpeg.size() || (jpeg.empty() && chunkIndex == 0)) {
+        const std::size_t chunkSize = std::min(kKeyImageChunkLength, jpeg.size() - offset);
+        std::vector<unsigned char> report(kKeyImageReportLength, 0);
+        report[0] = 0x02;
+        report[1] = 0x07;
+        report[2] = static_cast<unsigned char>(keyIndex);
+        report[3] = static_cast<unsigned char>((offset + chunkSize) >= jpeg.size() ? 1 : 0);
+        report[4] = static_cast<unsigned char>(chunkSize & 0xff);
+        report[5] = static_cast<unsigned char>((chunkSize >> 8) & 0xff);
+        report[6] = static_cast<unsigned char>(chunkIndex & 0xff);
+        report[7] = static_cast<unsigned char>((chunkIndex >> 8) & 0xff);
+        if (chunkSize > 0) {
+            std::copy(jpeg.begin() + static_cast<std::ptrdiff_t>(offset), jpeg.begin() + static_cast<std::ptrdiff_t>(offset + chunkSize), report.begin() + static_cast<std::ptrdiff_t>(kKeyImageHeaderLength));
+        }
+
+        const int bytesWritten = hid_write(device, report.data(), report.size());
+        if (bytesWritten < 0) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Failed to write key image report.";
+            }
+            return false;
+        }
+
+        offset += chunkSize;
+        ++chunkIndex;
+        if (jpeg.empty()) {
+            break;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -97,6 +154,11 @@ void StreamDeckHidBackend::stop() {
     if (!currentDeck_.connected) {
         statusLine_ = "Deck backend idle.";
     }
+}
+
+bool StreamDeckHidBackend::applyKeyVisuals(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return applyKeyVisualsLocked(visuals, errorMessage);
 }
 
 StreamDeckInfo StreamDeckHidBackend::currentDeck() const {
@@ -184,6 +246,53 @@ bool StreamDeckHidBackend::openDeviceLocked(const std::string& preferredSerial, 
     return true;
 }
 
+bool StreamDeckHidBackend::applyKeyVisualsLocked(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage) {
+    if (device_ == nullptr || !currentDeck_.connected || currentDeck_.key_count == 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "No Stream Deck connected for key image upload.";
+        }
+        return false;
+    }
+
+    std::unordered_map<int, StreamDeckKeyVisual> visualByKey;
+    for (const auto& visual : visuals) {
+        if (visual.key_index < 0) {
+            continue;
+        }
+        visualByKey[visual.key_index] = visual;
+    }
+
+    for (std::size_t index = 0; index < currentDeck_.key_count; ++index) {
+        StreamDeckKeyVisual visual;
+        visual.key_index = static_cast<int>(index);
+        if (const auto it = visualByKey.find(static_cast<int>(index)); it != visualByKey.end()) {
+            visual = it->second;
+        }
+
+        const auto background = backgroundForVisual(visual);
+        const auto jpeg = renderLabelKeyJpeg(
+            visual.label,
+            kKeyImageWidth,
+            kKeyImageHeight,
+            background,
+            {245, 247, 250});
+
+        std::string writeError;
+        if (!writeKeyImage(device_, static_cast<int>(index), jpeg, &writeError)) {
+            const std::string message = writeError.empty()
+                ? "Failed to upload key image."
+                : (writeError + " " + deviceErrorString(device_));
+            setStatusLocked(message);
+            if (errorMessage != nullptr) {
+                *errorMessage = message;
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void StreamDeckHidBackend::closeDeviceLocked() {
     if (device_ != nullptr) {
         hid_close(device_);
@@ -195,48 +304,46 @@ void StreamDeckHidBackend::closeDeviceLocked() {
 
 void StreamDeckHidBackend::workerLoop() {
     while (!stopRequested_.load()) {
-        hid_device* device = nullptr;
-        std::size_t keyCount = 0;
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            device = device_;
-            keyCount = currentDeck_.key_count;
-        }
-
-        if (device == nullptr || keyCount == 0) {
-            break;
-        }
-
-        std::vector<unsigned char> report(kInputReportHeaderLength + keyCount, 0);
-        const int bytesRead = hid_read_timeout(device, report.data(), report.size(), kReadTimeoutMs);
-        if (bytesRead < 0) {
-            std::lock_guard<std::mutex> guard(mutex_);
-            const std::string error = deviceErrorString(device_);
-            closeDeviceLocked();
-            setStatusLocked(error.empty() ? "Deck disconnected or read failed." : ("Deck read failed: " + error));
-            break;
-        }
-
-        if (bytesRead == 0 || static_cast<std::size_t>(bytesRead) < (kInputReportHeaderLength + keyCount)) {
-            continue;
-        }
-
+        std::vector<unsigned char> report;
+        std::vector<std::pair<int, bool>> changedKeys;
         StreamDeckKeyEventCallback callback;
+
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            callback = eventCallback_;
-        }
+            if (device_ == nullptr || currentDeck_.key_count == 0) {
+                break;
+            }
 
-        for (std::size_t index = 0; index < keyCount; ++index) {
-            const bool pressed = report[kInputReportHeaderLength + index] != 0;
-            if (index >= lastKeyStates_.size() || lastKeyStates_[index] == pressed) {
+            report.assign(kInputReportHeaderLength + currentDeck_.key_count, 0);
+            const int bytesRead = hid_read_timeout(device_, report.data(), report.size(), kReadTimeoutMs);
+            if (bytesRead < 0) {
+                const std::string error = deviceErrorString(device_);
+                closeDeviceLocked();
+                setStatusLocked(error.empty() ? "Deck disconnected or read failed." : ("Deck read failed: " + error));
+                break;
+            }
+
+            if (bytesRead == 0 || static_cast<std::size_t>(bytesRead) < (kInputReportHeaderLength + currentDeck_.key_count)) {
                 continue;
             }
 
-            lastKeyStates_[index] = pressed;
-            if (callback) {
-                callback(static_cast<int>(index), pressed);
+            callback = eventCallback_;
+            for (std::size_t index = 0; index < currentDeck_.key_count; ++index) {
+                const bool pressed = report[kInputReportHeaderLength + index] != 0;
+                if (index >= lastKeyStates_.size() || lastKeyStates_[index] == pressed) {
+                    continue;
+                }
+                lastKeyStates_[index] = pressed;
+                changedKeys.emplace_back(static_cast<int>(index), pressed);
             }
+        }
+
+        if (!callback) {
+            continue;
+        }
+
+        for (const auto& [keyIndex, pressed] : changedKeys) {
+            callback(keyIndex, pressed);
         }
     }
 }

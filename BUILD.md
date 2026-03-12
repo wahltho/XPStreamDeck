@@ -4,6 +4,7 @@
 - X-Plane SDK with `CHeaders`
 - CMake 3.15+
 - Vendored `hidapi` is included under `external/hidapi`
+- Vendored `stb_image_write.h` is included under `external/stb`
 
 This project sits one level deeper than the other local X-Plane repos, so the default SDK path is:
 `../../SDKs/XPlane_SDK`

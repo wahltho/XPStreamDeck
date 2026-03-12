@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -22,6 +23,14 @@ struct StreamDeckInfo {
     std::size_t key_count = 0;
 };
 
+struct StreamDeckKeyVisual {
+    int key_index = -1;
+    std::string label;
+    bool has_binding = false;
+    bool resolved = false;
+    bool hold_mode = false;
+};
+
 using StreamDeckKeyEventCallback = std::function<void(int keyIndex, bool pressed)>;
 
 class StreamDeckHidBackend {
@@ -35,12 +44,14 @@ public:
     void setEventCallback(StreamDeckKeyEventCallback callback);
     bool start(const std::string& preferredSerial, int brightnessPercent, std::string* errorMessage = nullptr);
     void stop();
+    bool applyKeyVisuals(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage = nullptr);
 
     StreamDeckInfo currentDeck() const;
     std::string statusLine() const;
 
 private:
     bool openDeviceLocked(const std::string& preferredSerial, int brightnessPercent, std::string* errorMessage);
+    bool applyKeyVisualsLocked(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage);
     void closeDeviceLocked();
     void workerLoop();
     void setStatusLocked(const std::string& status);

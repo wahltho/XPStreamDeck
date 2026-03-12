@@ -9,6 +9,7 @@ Current state:
 - Native X-Plane command dispatch scaffold for `once` and `hold` actions.
 - Native HID backend for Stream Deck MK.2-family 15-key devices.
 - Worker-thread key polling with handoff into the X-Plane flight loop.
+- Native key-image upload with rendered text labels on the Stream Deck buttons.
 
 ## Goals
 - No focus dependency on the X-Plane window.
@@ -40,23 +41,33 @@ The test command is still useful without hardware: it executes the first resolve
   - `0x00b9`
 
 The plugin opens the deck directly over HID, sets brightness, polls key state, and dispatches X-Plane commands without depending on keyboard focus or a separate helper process.
+It also renders simple text labels into JPEG key images and uploads them directly to the deck.
 
 ## Profile Format
 Profiles live in `<X-Plane>/Resources/plugins/XPStreamDeck/profiles/`.
 
 Current simple syntax:
 ```ini
+# label.<index>=TEXT or TEXT\nTEXT
 # key.<index>=<command>|<mode>
+label.0=PAUSE
 key.0=sim/operation/pause_toggle|once
+label.1=FLAPS\nDOWN
 key.1=sim/flight_controls/flaps_down|once
+label.2=FLAPS\nUP
 key.2=sim/flight_controls/flaps_up|once
+label.3=BRAKES
 key.3=sim/flight_controls/brakes_toggle_max|once
+label.4=REV\nHOLD
 key.4=sim/engines/thrust_reverse_hold|hold
 ```
 
 Supported modes:
 - `once`
 - `hold`
+
+`label.<index>` drives the text rendered onto the corresponding Stream Deck key.
+Use `\n` for a manual line break.
 
 ## Install Layout
 Expected X-Plane layout:
@@ -73,6 +84,6 @@ Expected X-Plane layout:
 See `BUILD.md`.
 
 ## Next Steps
-- Add key image output for labels and status feedback.
+- Add state-driven key styles and active/inactive feedback.
 - Expand beyond the current MK.2-family 15-key protocol.
 - Expand profile format once the device layer exists.
