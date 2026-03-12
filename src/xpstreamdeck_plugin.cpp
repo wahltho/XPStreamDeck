@@ -1,5 +1,6 @@
 #include "plugin_config.h"
 
+#include "XPLMDataAccess.h"
 #include "XPLMDisplay.h"
 #include "XPLMGraphics.h"
 #include "XPLMMenus.h"
@@ -34,6 +35,8 @@ constexpr const char* kNativePathsFeature = "XPLM_USE_NATIVE_PATHS";
 constexpr int kWindowWidth = 680;
 constexpr int kWindowHeight = 360;
 constexpr float kFlightLoopInterval = 0.05f;
+constexpr float kDeckReconnectRetrySeconds = 2.0f;
+constexpr float kProfileRetrySeconds = 5.0f;
 
 enum class InternalCommand {
     ToggleWindow,
@@ -69,9 +72,16 @@ struct Paths {
     fs::path pluginDir;
     fs::path prefsFile;
     fs::path profilesDir;
+    fs::path fallbackProfileFile;
     fs::path activeProfileFile;
     fs::path logDir;
     fs::path logFile;
+};
+
+struct ProfileCandidate {
+    fs::path path;
+    std::string profileName;
+    std::vector<std::string> tailnums;
 };
 
 struct ActionBinding {
@@ -102,7 +112,16 @@ XPLMCommandRef g_cmdTestFirstBinding = nullptr;
 bool g_windowVisible = false;
 bool g_pluginCurrentlyEnabled = false;
 bool g_flightLoopRegistered = false;
+bool g_deckWasConnected = false;
+bool g_deckReconnectPending = false;
+bool g_profileSelectionPending = false;
 int g_resolvedBindings = 0;
+float g_nextDeckReconnectAt = 0.0f;
+float g_nextProfileSelectionAt = 0.0f;
+std::vector<ProfileCandidate> g_profileCandidates;
+std::string g_activeProfileName = "default";
+std::string g_activeProfileSource = "fallback";
+std::string g_lastKnownTailnum = "<unknown>";
 std::string g_statusLine = "Plugin initialized.";
 std::string g_lastKeyEventLine = "No key events yet.";
 std::mutex g_eventMutex;
@@ -252,7 +271,10 @@ void refreshBasePaths() {
 
 void refreshActiveProfilePath() {
     g_prefs.activeProfile = sanitizeProfileName(g_prefs.activeProfile);
-    g_paths.activeProfileFile = g_paths.profilesDir / (g_prefs.activeProfile + ".cfg");
+    g_paths.fallbackProfileFile = g_paths.profilesDir / (g_prefs.activeProfile + ".cfg");
+    g_paths.activeProfileFile = g_paths.fallbackProfileFile;
+    g_activeProfileName = g_prefs.activeProfile;
+    g_activeProfileSource = "fallback";
 }
 
 void ensureDir(const fs::path& dir) {
@@ -264,16 +286,17 @@ void ensureDir(const fs::path& dir) {
 }
 
 void writeDefaultProfileIfMissing() {
-    if (fs::exists(g_paths.activeProfileFile)) {
+    if (fs::exists(g_paths.fallbackProfileFile)) {
         return;
     }
     ensureDir(g_paths.profilesDir);
-    std::ofstream out(g_paths.activeProfileFile);
+    std::ofstream out(g_paths.fallbackProfileFile);
     if (!out.is_open()) {
-        logLine("failed to create default profile: " + pathToDisplay(g_paths.activeProfileFile));
+        logLine("failed to create default profile: " + pathToDisplay(g_paths.fallbackProfileFile));
         return;
     }
     out
+        << "profile_id=default\n"
         << "# key.<index>=<command>|<mode>\n"
         << "# label.<index>=TEXT or TEXT\\nTEXT\n"
         << "# mode: once | hold\n"
@@ -288,7 +311,118 @@ void writeDefaultProfileIfMissing() {
         << "key.3=sim/flight_controls/brakes_toggle_max|once\n"
         << "label.4=REV\\nHOLD\n"
         << "key.4=sim/engines/thrust_reverse_hold|hold\n";
-    logLine("created default profile: " + pathToDisplay(g_paths.activeProfileFile));
+    logLine("created default profile: " + pathToDisplay(g_paths.fallbackProfileFile));
+}
+
+std::string readTailnum() {
+    static XPLMDataRef tailRef = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
+    if (!tailRef) {
+        return {};
+    }
+
+    char buf[256]{};
+    const int n = XPLMGetDatab(tailRef, buf, 0, sizeof(buf) - 1);
+    if (n <= 0) {
+        return {};
+    }
+
+    std::string raw(buf, static_cast<std::size_t>(n));
+    const auto nul = raw.find('\0');
+    if (nul != std::string::npos) {
+        raw.resize(nul);
+    }
+    return trimString(raw);
+}
+
+void clearProfileSelectionRetry() {
+    g_profileSelectionPending = false;
+    g_nextProfileSelectionAt = 0.0f;
+}
+
+void scheduleProfileSelectionRetry(float now, const std::string& reason) {
+    g_profileSelectionPending = true;
+    g_nextProfileSelectionAt = now + kProfileRetrySeconds;
+    if (!reason.empty()) {
+        logLine(reason);
+    }
+}
+
+void loadProfileCandidates() {
+    g_profileCandidates.clear();
+
+    if (!fs::exists(g_paths.profilesDir)) {
+        return;
+    }
+
+    std::vector<fs::path> profilePaths;
+    for (const auto& entry : fs::directory_iterator(g_paths.profilesDir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != ".cfg") {
+            continue;
+        }
+        profilePaths.push_back(entry.path());
+    }
+
+    std::sort(profilePaths.begin(), profilePaths.end());
+
+    std::map<std::string, std::string> tailnumOwner;
+    for (const auto& path : profilePaths) {
+        ProfileCandidate candidate;
+        candidate.path = path;
+        candidate.profileName = path.stem().string();
+
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            logLine("failed to inspect profile metadata: " + pathToDisplay(path));
+            continue;
+        }
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trimString(line);
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+
+            std::string lhs;
+            std::string rhs;
+            if (!splitOnce(line, '=', lhs, rhs)) {
+                continue;
+            }
+
+            const std::string key = toLowerCopy(trimString(lhs));
+            const std::string value = trimString(rhs);
+            if (key == "profile_id" && !value.empty()) {
+                candidate.profileName = value;
+            } else if (key == "tailnum" && !value.empty()) {
+                candidate.tailnums.push_back(value);
+            }
+        }
+
+        for (const auto& tailnum : candidate.tailnums) {
+            const auto existing = tailnumOwner.find(tailnum);
+            if (existing != tailnumOwner.end()) {
+                logLine("duplicate tailnum '" + tailnum + "' in " + pathToDisplay(path) + " (already in " + existing->second + ")");
+            } else {
+                tailnumOwner.emplace(tailnum, pathToDisplay(path));
+            }
+        }
+
+        g_profileCandidates.push_back(std::move(candidate));
+    }
+}
+
+const ProfileCandidate* findProfileCandidateByTailnum(const std::string& tailnum) {
+    for (const auto& candidate : g_profileCandidates) {
+        for (const auto& candidateTailnum : candidate.tailnums) {
+            if (candidateTailnum == tailnum) {
+                return &candidate;
+            }
+        }
+    }
+    return nullptr;
 }
 
 void savePrefs() {
@@ -433,7 +567,6 @@ void loadProfile() {
     releaseHeldBindings();
     g_bindings.clear();
     g_keyLabels.clear();
-    writeDefaultProfileIfMissing();
 
     std::ifstream in(g_paths.activeProfileFile);
     if (!in.is_open()) {
@@ -514,7 +647,7 @@ void loadProfile() {
     }
 
     resolveBindings();
-    logLine("active profile: " + g_prefs.activeProfile + " (" + pathToDisplay(g_paths.activeProfileFile) + ")");
+    logLine("active profile: " + g_activeProfileName + " [" + g_activeProfileSource + "] (" + pathToDisplay(g_paths.activeProfileFile) + ")");
 }
 
 std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
@@ -559,6 +692,62 @@ void refreshDeckKeyImages() {
     }
 }
 
+void activateProfile(const fs::path& path, const std::string& profileName, const std::string& source) {
+    g_paths.activeProfileFile = path;
+    g_activeProfileName = profileName;
+    g_activeProfileSource = source;
+    loadProfile();
+    refreshDeckKeyImages();
+}
+
+void selectProfileForAircraft(bool logNoMatch) {
+    const std::string tailnum = readTailnum();
+    g_lastKnownTailnum = tailnum.empty() ? "<unknown>" : tailnum;
+
+    if (tailnum.empty()) {
+        const bool alreadyPending = g_profileSelectionPending;
+        if (g_paths.activeProfileFile != g_paths.fallbackProfileFile) {
+            activateProfile(g_paths.fallbackProfileFile, g_prefs.activeProfile, "fallback");
+        } else {
+            refreshDeckKeyImages();
+        }
+        scheduleProfileSelectionRetry(XPLMGetElapsedTime(), alreadyPending ? std::string() : "tailnum not available, profile selection deferred.");
+        return;
+    }
+
+    clearProfileSelectionRetry();
+
+    if (const auto* match = findProfileCandidateByTailnum(tailnum); match != nullptr) {
+        activateProfile(match->path, match->profileName, "tailnum:" + tailnum);
+        return;
+    }
+
+    if (logNoMatch) {
+        logLine("no profile matched tailnum '" + tailnum + "', using fallback profile.");
+    }
+    activateProfile(g_paths.fallbackProfileFile, g_prefs.activeProfile, "fallback");
+}
+
+bool deckConnectionWanted() {
+    return g_pluginCurrentlyEnabled && g_prefs.enabled && (g_prefs.hidAutoConnect || !g_prefs.deckSerial.empty());
+}
+
+void clearDeckReconnectState() {
+    g_deckReconnectPending = false;
+    g_nextDeckReconnectAt = 0.0f;
+}
+
+void scheduleDeckReconnect(float now, const std::string& reason) {
+    if (!deckConnectionWanted()) {
+        clearDeckReconnectState();
+        return;
+    }
+
+    g_deckReconnectPending = true;
+    g_nextDeckReconnectAt = now + kDeckReconnectRetrySeconds;
+    g_statusLine = reason.empty() ? "Waiting for Stream Deck connection." : (reason + " Retrying automatically.");
+}
+
 void clearPendingKeyEvents() {
     std::lock_guard<std::mutex> guard(g_eventMutex);
     g_pendingKeyEvents.clear();
@@ -572,6 +761,35 @@ void queueKeyEvent(int keyIndex, bool pressed) {
 void stopDeckBackend() {
     clearPendingKeyEvents();
     g_deckBackend.stop();
+    g_deckWasConnected = false;
+    clearDeckReconnectState();
+}
+
+bool tryConnectDeckBackend(bool logFailures) {
+    g_deckBackend.setEventCallback(queueKeyEvent);
+
+    std::string errorMessage;
+    if (!g_deckBackend.start(g_prefs.deckSerial, g_prefs.brightness, &errorMessage)) {
+        if (logFailures && !errorMessage.empty()) {
+            logLine(errorMessage);
+        }
+        scheduleDeckReconnect(XPLMGetElapsedTime(), errorMessage);
+        g_deckWasConnected = false;
+        return false;
+    }
+
+    const auto deck = g_deckBackend.currentDeck();
+    std::ostringstream msg;
+    msg << "Deck ready: " << deck.product_name;
+    if (!deck.serial.empty()) {
+        msg << " [" << deck.serial << "]";
+    }
+    g_statusLine = msg.str();
+    logLine(g_statusLine);
+    g_deckWasConnected = true;
+    clearDeckReconnectState();
+    refreshDeckKeyImages();
+    return true;
 }
 
 void startDeckBackend() {
@@ -591,26 +809,7 @@ void startDeckBackend() {
         return;
     }
 
-    g_deckBackend.setEventCallback(queueKeyEvent);
-
-    std::string errorMessage;
-    if (!g_deckBackend.start(g_prefs.deckSerial, g_prefs.brightness, &errorMessage)) {
-        g_statusLine = errorMessage;
-        if (!errorMessage.empty()) {
-            logLine(errorMessage);
-        }
-        return;
-    }
-
-    const auto deck = g_deckBackend.currentDeck();
-    std::ostringstream msg;
-    msg << "Deck ready: " << deck.product_name;
-    if (!deck.serial.empty()) {
-        msg << " [" << deck.serial << "]";
-    }
-    g_statusLine = msg.str();
-    logLine(g_statusLine);
-    refreshDeckKeyImages();
+    tryConnectDeckBackend(true);
 }
 
 void reconfigureDeckBackend() {
@@ -640,8 +839,10 @@ void reloadRuntimeConfig() {
     ensureDir(g_paths.pluginDir);
     ensureDir(g_paths.profilesDir);
     ensureDir(g_paths.logDir);
+    writeDefaultProfileIfMissing();
+    loadProfileCandidates();
     reopenLogFile();
-    loadProfile();
+    selectProfileForAircraft(false);
     g_windowVisible = g_prefs.showWindowOnStart || g_windowVisible;
     applyWindowVisibility();
     reconfigureDeckBackend();
@@ -696,12 +897,60 @@ void processPendingKeyEvents() {
     }
 }
 
+void maintainDeckBackend() {
+    const auto deck = g_deckBackend.currentDeck();
+    const float now = XPLMGetElapsedTime();
+
+    if (deck.connected) {
+        g_deckWasConnected = true;
+        clearDeckReconnectState();
+        return;
+    }
+
+    if (g_deckWasConnected) {
+        g_deckWasConnected = false;
+        clearPendingKeyEvents();
+        releaseHeldBindings();
+        g_lastKeyEventLine = "Deck disconnected.";
+        logLine("Stream Deck disconnected. Waiting for reconnect.");
+        scheduleDeckReconnect(now, "Stream Deck disconnected.");
+        return;
+    }
+
+    if (!deckConnectionWanted()) {
+        clearDeckReconnectState();
+        return;
+    }
+
+    if (!g_deckReconnectPending) {
+        scheduleDeckReconnect(now - kDeckReconnectRetrySeconds, "");
+    }
+
+    if (now < g_nextDeckReconnectAt) {
+        return;
+    }
+
+    tryConnectDeckBackend(false);
+}
+
+void maintainProfileSelection() {
+    if (!g_profileSelectionPending) {
+        return;
+    }
+    if (XPLMGetElapsedTime() < g_nextProfileSelectionAt) {
+        return;
+    }
+    selectProfileForAircraft(false);
+}
+
 float flightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
     (void)inElapsedSinceLastCall;
     (void)inElapsedTimeSinceLastFlightLoop;
     (void)inCounter;
     (void)inRefcon;
     processPendingKeyEvents();
+    maintainDeckBackend();
+    maintainProfileSelection();
     return kFlightLoopInterval;
 }
 
@@ -808,9 +1057,11 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     y -= step;
     drawTextLine(x, y, "Last key event: " + ellipsizeMiddle(g_lastKeyEventLine, 78));
     y -= step;
-    drawTextLine(x, y, "Profile: " + g_prefs.activeProfile + " -> " + ellipsizeMiddle(pathToDisplay(g_paths.activeProfileFile), 70));
+    drawTextLine(x, y, "Profile: " + g_activeProfileName + " [" + g_activeProfileSource + "] -> " + ellipsizeMiddle(pathToDisplay(g_paths.activeProfileFile), 58));
     y -= step;
     drawTextLine(x, y, "Bindings: " + std::to_string(g_bindings.size()) + " loaded, " + std::to_string(g_resolvedBindings) + " resolved");
+    y -= step;
+    drawTextLine(x, y, "Tailnum: " + g_lastKnownTailnum + "  Fallback: " + g_prefs.activeProfile);
     y -= step;
     drawTextLine(x, y, "Prefs: " + ellipsizeMiddle(pathToDisplay(g_paths.prefsFile), 84));
     y -= step * 2;
@@ -972,6 +1223,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     ensureDir(g_paths.pluginDir);
     ensureDir(g_paths.profilesDir);
     ensureDir(g_paths.logDir);
+    writeDefaultProfileIfMissing();
+    loadProfileCandidates();
     reopenLogFile();
 
     logLine("starting " + std::string(PLUGIN_NAME) + " v" + PLUGIN_VERSION);
@@ -981,7 +1234,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     createWindow();
     registerFlightLoop();
 
-    loadProfile();
+    selectProfileForAircraft(false);
     g_windowVisible = g_prefs.showWindowOnStart;
     applyWindowVisibility();
 
@@ -1019,8 +1272,7 @@ PLUGIN_API void XPluginDisable(void) {
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFromWho, int inMessage, void* inParam) {
     (void)inFromWho;
     if (inMessage == XPLM_MSG_PLANE_LOADED && inParam == nullptr) {
-        logLine("aircraft loaded, re-resolving profile commands");
-        loadProfile();
-        refreshDeckKeyImages();
+        logLine("aircraft loaded, selecting profile by tailnum");
+        selectProfileForAircraft(true);
     }
 }

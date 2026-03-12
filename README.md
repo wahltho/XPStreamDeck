@@ -10,6 +10,8 @@ Current state:
 - Native HID backend for Stream Deck MK.2-family 15-key devices.
 - Worker-thread key polling with handoff into the X-Plane flight loop.
 - Native key-image upload with rendered text labels on the Stream Deck buttons.
+- Automatic reconnect after disconnect or late device attach.
+- Aircraft-specific profile selection via exact tailnum matching with fallback profile.
 
 ## Goals
 - No focus dependency on the X-Plane window.
@@ -42,14 +44,18 @@ The test command is still useful without hardware: it executes the first resolve
 
 The plugin opens the deck directly over HID, sets brightness, polls key state, and dispatches X-Plane commands without depending on keyboard focus or a separate helper process.
 It also renders simple text labels into JPEG key images and uploads them directly to the deck.
+If the deck is unplugged or connected after X-Plane/plugin startup, the plugin retries automatically.
 
 ## Profile Format
 Profiles live in `<X-Plane>/Resources/plugins/XPStreamDeck/profiles/`.
 
-Current simple syntax:
+Current syntax:
 ```ini
+# profile_id=<name>
+# tailnum=<exact-tail-number>
 # label.<index>=TEXT or TEXT\nTEXT
 # key.<index>=<command>|<mode>
+profile_id=default
 label.0=PAUSE
 key.0=sim/operation/pause_toggle|once
 label.1=FLAPS\nDOWN
@@ -68,6 +74,8 @@ Supported modes:
 
 `label.<index>` drives the text rendered onto the corresponding Stream Deck key.
 Use `\n` for a manual line break.
+`tailnum=` can be repeated and is matched exactly and case-sensitively against `sim/aircraft/view/acf_tailnum`.
+If no aircraft-specific profile matches, the plugin falls back to the profile named in `active_profile`.
 
 ## Install Layout
 Expected X-Plane layout:
@@ -86,4 +94,4 @@ See `BUILD.md`.
 ## Next Steps
 - Add state-driven key styles and active/inactive feedback.
 - Expand beyond the current MK.2-family 15-key protocol.
-- Expand profile format once the device layer exists.
+- Expand profile actions beyond `once` and `hold`.
