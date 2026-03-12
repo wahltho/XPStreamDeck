@@ -1,0 +1,55 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# CMake / build trees
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+compile_commands.json
+cmake_install.cmake
+install_manifest.txt
+Makefile
+
+# Compiler / linker artifacts
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.ilk
+*.pdb
+*.dwo
+*.lai
+*.la
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.xpl
+
+# Logs
+*.log
+
+# Python leftovers
+__pycache__/
+
+# Local staging artifacts
+deploy/**/64/*.xpl
