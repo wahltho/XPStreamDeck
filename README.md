@@ -7,7 +7,8 @@ Current state:
 - Plugin menu, commands, prefs, log file, status window.
 - Profile loader for simple key-to-command mappings.
 - Native X-Plane command dispatch scaffold for `once` and `hold` actions.
-- Stream Deck HID backend is not implemented yet.
+- Native HID backend for Stream Deck MK.2-family 15-key devices.
+- Worker-thread key polling with handoff into the X-Plane flight loop.
 
 ## Goals
 - No focus dependency on the X-Plane window.
@@ -27,7 +28,18 @@ Current state:
 - `XPStreamDeck/reload_prefs`
 - `XPStreamDeck/test_first_binding`
 
-The test command is useful before hardware integration: it executes the first resolved profile binding through the normal dispatch path.
+The test command is still useful without hardware: it executes the first resolved profile binding through the normal dispatch path.
+
+## Current Hardware Scope
+- Elgato vendor ID `0x0fd9`
+- Stream Deck MK.2 family on the 15-key protocol
+- Supported product IDs in the current backend:
+  - `0x006d`
+  - `0x0080`
+  - `0x00a5`
+  - `0x00b9`
+
+The plugin opens the deck directly over HID, sets brightness, polls key state, and dispatches X-Plane commands without depending on keyboard focus or a separate helper process.
 
 ## Profile Format
 Profiles live in `<X-Plane>/Resources/plugins/XPStreamDeck/profiles/`.
@@ -61,8 +73,6 @@ Expected X-Plane layout:
 See `BUILD.md`.
 
 ## Next Steps
-- Add HID backend for Stream Deck MK.2 first.
-- Poll key state in a worker thread and queue events into the flight loop.
-- Add image and brightness handling.
+- Add key image output for labels and status feedback.
+- Expand beyond the current MK.2-family 15-key protocol.
 - Expand profile format once the device layer exists.
-

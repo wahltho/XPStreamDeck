@@ -3,6 +3,7 @@
 ## Requirements
 - X-Plane SDK with `CHeaders`
 - CMake 3.15+
+- Vendored `hidapi` is included under `external/hidapi`
 
 This project sits one level deeper than the other local X-Plane repos, so the default SDK path is:
 `../../SDKs/XPlane_SDK`
@@ -44,4 +45,3 @@ cp -f build-mac-universal/mac.xpl deploy/XPStreamDeck/64/mac.xpl
 cp -f build-lin/lin.xpl deploy/XPStreamDeck/64/lin.xpl
 cp -f build-win/win.xpl deploy/XPStreamDeck/64/win.xpl
 ```
-

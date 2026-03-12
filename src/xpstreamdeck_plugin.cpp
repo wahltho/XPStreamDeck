@@ -4,29 +4,35 @@
 #include "XPLMGraphics.h"
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
+#include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
 #include <algorithm>
-#include <array>
+#include <cctype>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
 
 #include "plugin_utils.h"
+#include "streamdeck_hid.h"
 
 namespace {
 
 namespace fs = std::filesystem;
 
 constexpr const char* kNativePathsFeature = "XPLM_USE_NATIVE_PATHS";
-constexpr int kWindowWidth = 620;
-constexpr int kWindowHeight = 300;
+constexpr int kWindowWidth = 680;
+constexpr int kWindowHeight = 360;
+constexpr float kFlightLoopInterval = 0.05f;
 
 enum class InternalCommand {
     ToggleWindow,
@@ -34,16 +40,27 @@ enum class InternalCommand {
     TestFirstBinding,
 };
 
+void* commandRefcon(InternalCommand command) {
+    return reinterpret_cast<void*>(static_cast<std::intptr_t>(command) + 1);
+}
+
+InternalCommand decodeCommandRefcon(void* refcon) {
+    return static_cast<InternalCommand>(reinterpret_cast<std::intptr_t>(refcon) - 1);
+}
+
 enum class ActionMode {
     Once,
     Hold,
 };
 
 struct Prefs {
-    bool enabled = false;
+    bool enabled = true;
     bool logfileEnabled = true;
     bool showWindowOnStart = false;
+    bool hidAutoConnect = true;
     std::string activeProfile = "default";
+    std::string deckSerial;
+    int brightness = 75;
 };
 
 struct Paths {
@@ -64,6 +81,11 @@ struct ActionBinding {
     bool active = false;
 };
 
+struct PendingKeyEvent {
+    int keyIndex = -1;
+    bool pressed = false;
+};
+
 Prefs g_prefs;
 Paths g_paths;
 std::vector<ActionBinding> g_bindings;
@@ -75,9 +97,14 @@ XPLMCommandRef g_cmdToggleWindow = nullptr;
 XPLMCommandRef g_cmdReloadPrefs = nullptr;
 XPLMCommandRef g_cmdTestFirstBinding = nullptr;
 bool g_windowVisible = false;
+bool g_pluginCurrentlyEnabled = false;
+bool g_flightLoopRegistered = false;
 int g_resolvedBindings = 0;
-std::string g_statusLine = "Scaffold ready. HID backend pending.";
-std::string g_lastProfileSummary = "No profile loaded yet.";
+std::string g_statusLine = "Plugin initialized.";
+std::string g_lastKeyEventLine = "No key events yet.";
+std::mutex g_eventMutex;
+std::deque<PendingKeyEvent> g_pendingKeyEvents;
+xpstreamdeck::StreamDeckHidBackend g_deckBackend;
 
 std::string pathToDisplay(const fs::path& p) {
     return p.generic_string();
@@ -186,7 +213,10 @@ void savePrefs() {
         << "enabled=" << bool01(g_prefs.enabled) << '\n'
         << "logfile_enabled=" << bool01(g_prefs.logfileEnabled) << '\n'
         << "show_window_on_start=" << bool01(g_prefs.showWindowOnStart) << '\n'
-        << "active_profile=" << g_prefs.activeProfile << '\n';
+        << "hid_auto_connect=" << bool01(g_prefs.hidAutoConnect) << '\n'
+        << "active_profile=" << g_prefs.activeProfile << '\n'
+        << "deck_serial=" << g_prefs.deckSerial << '\n'
+        << "brightness=" << g_prefs.brightness << '\n';
 }
 
 void loadPrefs() {
@@ -224,11 +254,22 @@ void loadPrefs() {
             parseBool(value, g_prefs.logfileEnabled);
         } else if (key == "show_window_on_start") {
             parseBool(value, g_prefs.showWindowOnStart);
+        } else if (key == "hid_auto_connect") {
+            parseBool(value, g_prefs.hidAutoConnect);
         } else if (key == "active_profile") {
             g_prefs.activeProfile = value;
+        } else if (key == "deck_serial") {
+            g_prefs.deckSerial = value;
+        } else if (key == "brightness") {
+            try {
+                g_prefs.brightness = std::stoi(value);
+            } catch (...) {
+            }
         }
     }
+
     g_prefs.activeProfile = sanitizeProfileName(g_prefs.activeProfile);
+    g_prefs.brightness = std::clamp(g_prefs.brightness, 0, 100);
 }
 
 void reopenLogFile() {
@@ -271,6 +312,15 @@ void releaseHeldBindings() {
     }
 }
 
+ActionBinding* findBindingForKey(int keyIndex) {
+    for (auto& binding : g_bindings) {
+        if (binding.keyIndex == keyIndex) {
+            return &binding;
+        }
+    }
+    return nullptr;
+}
+
 void resolveBindings() {
     g_resolvedBindings = 0;
     for (auto& binding : g_bindings) {
@@ -285,8 +335,7 @@ void resolveBindings() {
 
     std::ostringstream summary;
     summary << "Loaded " << g_bindings.size() << " binding(s), resolved " << g_resolvedBindings << '.';
-    g_lastProfileSummary = summary.str();
-    g_statusLine = g_lastProfileSummary;
+    g_statusLine = summary.str();
 }
 
 void loadProfile() {
@@ -322,10 +371,6 @@ void loadProfile() {
         }
 
         const std::string indexString = lhs.substr(4);
-        if (indexString.empty()) {
-            continue;
-        }
-
         int keyIndex = -1;
         try {
             keyIndex = std::stoi(indexString);
@@ -357,6 +402,66 @@ void loadProfile() {
     logLine("active profile: " + g_prefs.activeProfile + " (" + pathToDisplay(g_paths.activeProfileFile) + ")");
 }
 
+void clearPendingKeyEvents() {
+    std::lock_guard<std::mutex> guard(g_eventMutex);
+    g_pendingKeyEvents.clear();
+}
+
+void queueKeyEvent(int keyIndex, bool pressed) {
+    std::lock_guard<std::mutex> guard(g_eventMutex);
+    g_pendingKeyEvents.push_back(PendingKeyEvent{keyIndex, pressed});
+}
+
+void stopDeckBackend() {
+    clearPendingKeyEvents();
+    g_deckBackend.stop();
+}
+
+void startDeckBackend() {
+    stopDeckBackend();
+
+    if (!g_pluginCurrentlyEnabled) {
+        return;
+    }
+
+    if (!g_prefs.enabled) {
+        g_statusLine = "Deck backend disabled in prefs.";
+        return;
+    }
+
+    if (!g_prefs.hidAutoConnect && g_prefs.deckSerial.empty()) {
+        g_statusLine = "Deck auto-connect disabled and no serial configured.";
+        return;
+    }
+
+    g_deckBackend.setEventCallback(queueKeyEvent);
+
+    std::string errorMessage;
+    if (!g_deckBackend.start(g_prefs.deckSerial, g_prefs.brightness, &errorMessage)) {
+        g_statusLine = errorMessage;
+        if (!errorMessage.empty()) {
+            logLine(errorMessage);
+        }
+        return;
+    }
+
+    const auto deck = g_deckBackend.currentDeck();
+    std::ostringstream msg;
+    msg << "Deck ready: " << deck.product_name;
+    if (!deck.serial.empty()) {
+        msg << " [" << deck.serial << "]";
+    }
+    g_statusLine = msg.str();
+    logLine(g_statusLine);
+}
+
+void reconfigureDeckBackend() {
+    stopDeckBackend();
+    if (g_pluginCurrentlyEnabled) {
+        startDeckBackend();
+    }
+}
+
 void toggleWindow() {
     g_windowVisible = !g_windowVisible;
     if (g_window != nullptr) {
@@ -381,6 +486,7 @@ void reloadRuntimeConfig() {
     loadProfile();
     g_windowVisible = g_prefs.showWindowOnStart || g_windowVisible;
     applyWindowVisibility();
+    reconfigureDeckBackend();
     logLine("prefs reloaded from " + pathToDisplay(g_paths.prefsFile));
 }
 
@@ -409,9 +515,57 @@ void dispatchBinding(ActionBinding& binding, bool pressed) {
     }
 }
 
+void processPendingKeyEvents() {
+    std::deque<PendingKeyEvent> events;
+    {
+        std::lock_guard<std::mutex> guard(g_eventMutex);
+        events.swap(g_pendingKeyEvents);
+    }
+
+    for (const auto& event : events) {
+        std::ostringstream msg;
+        ActionBinding* binding = findBindingForKey(event.keyIndex);
+        if (binding == nullptr) {
+            msg << "Deck key." << event.keyIndex << (event.pressed ? " pressed" : " released") << " -> unbound";
+            g_lastKeyEventLine = msg.str();
+            continue;
+        }
+
+        dispatchBinding(*binding, event.pressed);
+        msg << "Deck key." << event.keyIndex << (event.pressed ? " pressed" : " released")
+            << " -> " << binding->commandPath << " (" << actionModeName(binding->mode) << ")";
+        g_lastKeyEventLine = msg.str();
+    }
+}
+
+float flightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
+    (void)inElapsedSinceLastCall;
+    (void)inElapsedTimeSinceLastFlightLoop;
+    (void)inCounter;
+    (void)inRefcon;
+    processPendingKeyEvents();
+    return kFlightLoopInterval;
+}
+
+void registerFlightLoop() {
+    if (g_flightLoopRegistered) {
+        return;
+    }
+    XPLMRegisterFlightLoopCallback(flightLoopCallback, kFlightLoopInterval, nullptr);
+    g_flightLoopRegistered = true;
+}
+
+void unregisterFlightLoop() {
+    if (!g_flightLoopRegistered) {
+        return;
+    }
+    XPLMUnregisterFlightLoopCallback(flightLoopCallback, nullptr);
+    g_flightLoopRegistered = false;
+}
+
 int commandHandler(XPLMCommandRef inCommand, XPLMCommandPhase inPhase, void* inRefcon) {
     (void)inCommand;
-    const auto which = static_cast<InternalCommand>(reinterpret_cast<std::intptr_t>(inRefcon));
+    const auto which = decodeCommandRefcon(inRefcon);
 
     if (which == InternalCommand::ToggleWindow) {
         if (inPhase == xplm_CommandBegin) {
@@ -474,6 +628,8 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     XPLMSetGraphicsState(0, 0, 0, 0, 1, 0, 0);
     XPLMDrawTranslucentDarkBox(left, top, right, bottom);
 
+    const auto deck = g_deckBackend.currentDeck();
+    const std::string deckStatus = g_deckBackend.statusLine();
     const int x = left + 18;
     int y = top - 34;
     const int step = 19;
@@ -482,15 +638,23 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     y -= step;
     drawTextLine(x, y, "Status: " + g_statusLine, 0.85f, 0.92f, 1.0f);
     y -= step;
-    drawTextLine(x, y, "Backend: Stream Deck HID integration pending");
+    drawTextLine(x, y, "Deck: " + deckStatus, 0.82f, 0.95f, 0.86f);
     y -= step;
-    drawTextLine(x, y, "Prefs: " + ellipsizeMiddle(pathToDisplay(g_paths.prefsFile), 84));
+    if (deck.connected) {
+        drawTextLine(x, y, "Device: " + deck.product_name + (deck.serial.empty() ? std::string() : (" [" + deck.serial + "]")));
+    } else {
+        drawTextLine(x, y, "Device filter: " + (g_prefs.deckSerial.empty() ? std::string("<auto>") : g_prefs.deckSerial));
+    }
     y -= step;
-    drawTextLine(x, y, "Profile: " + g_prefs.activeProfile + " -> " + ellipsizeMiddle(pathToDisplay(g_paths.activeProfileFile), 72));
+    drawTextLine(x, y, "Brightness: " + std::to_string(g_prefs.brightness) + "%  Auto-connect: " + std::string(g_prefs.hidAutoConnect ? "on" : "off"));
+    y -= step;
+    drawTextLine(x, y, "Last key event: " + ellipsizeMiddle(g_lastKeyEventLine, 78));
+    y -= step;
+    drawTextLine(x, y, "Profile: " + g_prefs.activeProfile + " -> " + ellipsizeMiddle(pathToDisplay(g_paths.activeProfileFile), 70));
     y -= step;
     drawTextLine(x, y, "Bindings: " + std::to_string(g_bindings.size()) + " loaded, " + std::to_string(g_resolvedBindings) + " resolved");
     y -= step;
-    drawTextLine(x, y, "Plugin enabled flag: " + std::string(g_prefs.enabled ? "on" : "off"));
+    drawTextLine(x, y, "Prefs: " + ellipsizeMiddle(pathToDisplay(g_paths.prefsFile), 84));
     y -= step * 2;
     drawTextLine(x, y, "Commands:", 1.0f, 0.9f, 0.7f);
     y -= step;
@@ -576,7 +740,7 @@ void createWindow() {
     }
 
     XPLMSetWindowTitle(g_window, PLUGIN_MENU_TITLE);
-    XPLMSetWindowResizingLimits(g_window, 420, 220, 1200, 800);
+    XPLMSetWindowResizingLimits(g_window, 460, 260, 1400, 900);
     XPLMSetWindowPositioningMode(g_window, xplm_WindowCenterOnMonitor, -1);
     applyWindowVisibility();
 }
@@ -595,20 +759,20 @@ void registerCommands() {
     g_cmdReloadPrefs = XPLMCreateCommand((prefix + "/reload_prefs").c_str(), "Reload XPStreamDeck prefs and active profile");
     g_cmdTestFirstBinding = XPLMCreateCommand((prefix + "/test_first_binding").c_str(), "Trigger the first resolved XPStreamDeck binding");
 
-    XPLMRegisterCommandHandler(g_cmdToggleWindow, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::ToggleWindow));
-    XPLMRegisterCommandHandler(g_cmdReloadPrefs, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::ReloadPrefs));
-    XPLMRegisterCommandHandler(g_cmdTestFirstBinding, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::TestFirstBinding));
+    XPLMRegisterCommandHandler(g_cmdToggleWindow, commandHandler, 1, commandRefcon(InternalCommand::ToggleWindow));
+    XPLMRegisterCommandHandler(g_cmdReloadPrefs, commandHandler, 1, commandRefcon(InternalCommand::ReloadPrefs));
+    XPLMRegisterCommandHandler(g_cmdTestFirstBinding, commandHandler, 1, commandRefcon(InternalCommand::TestFirstBinding));
 }
 
 void unregisterCommands() {
     if (g_cmdToggleWindow != nullptr) {
-        XPLMUnregisterCommandHandler(g_cmdToggleWindow, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::ToggleWindow));
+        XPLMUnregisterCommandHandler(g_cmdToggleWindow, commandHandler, 1, commandRefcon(InternalCommand::ToggleWindow));
     }
     if (g_cmdReloadPrefs != nullptr) {
-        XPLMUnregisterCommandHandler(g_cmdReloadPrefs, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::ReloadPrefs));
+        XPLMUnregisterCommandHandler(g_cmdReloadPrefs, commandHandler, 1, commandRefcon(InternalCommand::ReloadPrefs));
     }
     if (g_cmdTestFirstBinding != nullptr) {
-        XPLMUnregisterCommandHandler(g_cmdTestFirstBinding, commandHandler, 1, reinterpret_cast<void*>(InternalCommand::TestFirstBinding));
+        XPLMUnregisterCommandHandler(g_cmdTestFirstBinding, commandHandler, 1, commandRefcon(InternalCommand::TestFirstBinding));
     }
 }
 
@@ -655,6 +819,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     registerCommands();
     createMenu();
     createWindow();
+    registerFlightLoop();
 
     loadProfile();
     g_windowVisible = g_prefs.showWindowOnStart;
@@ -665,7 +830,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
 PLUGIN_API void XPluginStop(void) {
     logLine("stopping plugin");
+    g_pluginCurrentlyEnabled = false;
+    stopDeckBackend();
     releaseHeldBindings();
+    unregisterFlightLoop();
     destroyWindow();
     destroyMenu();
     unregisterCommands();
@@ -675,11 +843,15 @@ PLUGIN_API void XPluginStop(void) {
 }
 
 PLUGIN_API int XPluginEnable(void) {
+    g_pluginCurrentlyEnabled = true;
+    startDeckBackend();
     logLine("plugin enabled");
     return 1;
 }
 
 PLUGIN_API void XPluginDisable(void) {
+    g_pluginCurrentlyEnabled = false;
+    stopDeckBackend();
     releaseHeldBindings();
     logLine("plugin disabled");
 }

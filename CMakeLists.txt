@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(xpstreamdeck LANGUAGES CXX)
+project(xpstreamdeck LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,8 +48,61 @@ function(configure_xplm_target target)
     )
 endfunction()
 
-add_library(xpstreamdeck SHARED src/xpstreamdeck_plugin.cpp)
+find_package(Threads REQUIRED)
+
+set(HIDAPI_ROOT "${CMAKE_SOURCE_DIR}/external/hidapi")
+set(HIDAPI_INCLUDE_DIR "${HIDAPI_ROOT}/hidapi")
+
+if(APPLE)
+    add_library(hidapi_local STATIC
+        "${HIDAPI_ROOT}/mac/hid.c"
+        "${HIDAPI_ROOT}/mac/hidapi_darwin.h"
+        "${HIDAPI_ROOT}/hidapi/hidapi.h"
+    )
+    target_include_directories(hidapi_local
+        PUBLIC "${HIDAPI_INCLUDE_DIR}"
+        PRIVATE "${HIDAPI_ROOT}/mac"
+    )
+    target_link_libraries(hidapi_local PRIVATE Threads::Threads "-framework IOKit" "-framework CoreFoundation")
+elseif(WIN32)
+    add_library(hidapi_local STATIC
+        "${HIDAPI_ROOT}/windows/hid.c"
+        "${HIDAPI_ROOT}/windows/hidapi_descriptor_reconstruct.c"
+        "${HIDAPI_ROOT}/windows/hidapi_cfgmgr32.h"
+        "${HIDAPI_ROOT}/windows/hidapi_descriptor_reconstruct.h"
+        "${HIDAPI_ROOT}/windows/hidapi_hidclass.h"
+        "${HIDAPI_ROOT}/windows/hidapi_hidpi.h"
+        "${HIDAPI_ROOT}/windows/hidapi_hidsdi.h"
+        "${HIDAPI_ROOT}/windows/hidapi_winapi.h"
+        "${HIDAPI_ROOT}/hidapi/hidapi.h"
+    )
+    target_include_directories(hidapi_local
+        PUBLIC "${HIDAPI_INCLUDE_DIR}"
+        PRIVATE "${HIDAPI_ROOT}/windows"
+    )
+    target_compile_definitions(hidapi_local PUBLIC HID_API_NO_EXPORT_DEFINE)
+    target_link_libraries(hidapi_local PRIVATE setupapi hid cfgmgr32)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(libudev REQUIRED IMPORTED_TARGET libudev)
+
+    add_library(hidapi_local STATIC
+        "${HIDAPI_ROOT}/linux/hid.c"
+        "${HIDAPI_ROOT}/hidapi/hidapi.h"
+    )
+    target_include_directories(hidapi_local
+        PUBLIC "${HIDAPI_INCLUDE_DIR}"
+        PRIVATE "${HIDAPI_ROOT}/linux"
+    )
+    target_link_libraries(hidapi_local PRIVATE Threads::Threads PkgConfig::libudev)
+endif()
+
+add_library(xpstreamdeck SHARED
+    src/streamdeck_hid.cpp
+    src/xpstreamdeck_plugin.cpp
+)
 configure_xplm_target(xpstreamdeck)
+target_link_libraries(xpstreamdeck PRIVATE hidapi_local)
 
 if(APPLE)
     set_target_properties(xpstreamdeck PROPERTIES OUTPUT_NAME "mac")
@@ -58,4 +111,3 @@ elseif(WIN32)
 else()
     set_target_properties(xpstreamdeck PROPERTIES OUTPUT_NAME "lin")
 endif()
-
