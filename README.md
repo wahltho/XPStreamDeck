@@ -5,6 +5,7 @@ Standalone X-Plane plugin scaffold for using an Elgato Stream Deck without a sep
 Current state:
 - Cross-platform X-Plane plugin shell in C++17.
 - Plugin menu, commands, prefs, log file, status window.
+- Structured logging with `ERROR`/`WARN`/`INFO`/`DEBUG` levels.
 - Profile loader for simple key-to-command mappings.
 - Native X-Plane command dispatch scaffold for `once` and `hold` actions.
 - Native HID backend for Stream Deck MK.2-family 15-key devices.
@@ -12,6 +13,7 @@ Current state:
 - Native key-image upload with rendered text labels on the Stream Deck buttons.
 - Automatic reconnect after disconnect or late device attach.
 - Aircraft-specific profile selection via exact tailnum matching with fallback profile.
+- Debug-log toggle via prefs for high-detail field diagnostics.
 
 ## Goals
 - No focus dependency on the X-Plane window.
@@ -25,6 +27,25 @@ Current state:
 - Command prefix: `XPStreamDeck`
 - Prefs file: `XPStreamDeck.prf`
 - Log file: `xpstreamdeck.log`
+
+## Logging
+- Normal logging writes `ERROR`, `WARN`, and `INFO`.
+- `DEBUG` logging is enabled with `debug_logging=1` in `XPStreamDeck.prf`.
+- Logs go to both `XPLMDebugString` and `log/xpstreamdeck.log` when `logfile_enabled=1`.
+- The plugin now logs prefs parsing, profile scanning/parsing, tailnum selection, HID connect/reconnect, key-image upload, key events, and command dispatch.
+
+## Prefs Format
+Example `XPStreamDeck.prf`:
+```ini
+enabled=1
+logfile_enabled=1
+debug_logging=0
+show_window_on_start=0
+hid_auto_connect=1
+active_profile=default
+deck_serial=
+brightness=75
+```
 
 ## Included So Far
 - `XPStreamDeck/toggle_window`

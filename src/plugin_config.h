@@ -1,7 +1,7 @@
 #pragma once
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "0.2.0"
 #endif
 
 #ifndef PLUGIN_NAME
@@ -31,4 +31,3 @@
 #ifndef PLUGIN_MENU_TITLE
 #define PLUGIN_MENU_TITLE "XPStreamDeck"
 #endif
-

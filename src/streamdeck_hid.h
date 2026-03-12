@@ -31,7 +31,15 @@ struct StreamDeckKeyVisual {
     bool hold_mode = false;
 };
 
+enum class StreamDeckBackendLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+};
+
 using StreamDeckKeyEventCallback = std::function<void(int keyIndex, bool pressed)>;
+using StreamDeckBackendLogCallback = std::function<void(StreamDeckBackendLogLevel level, const std::string& message)>;
 
 class StreamDeckHidBackend {
 public:
@@ -42,6 +50,7 @@ public:
     StreamDeckHidBackend& operator=(const StreamDeckHidBackend&) = delete;
 
     void setEventCallback(StreamDeckKeyEventCallback callback);
+    void setLogCallback(StreamDeckBackendLogCallback callback);
     bool start(const std::string& preferredSerial, int brightnessPercent, std::string* errorMessage = nullptr);
     void stop();
     bool applyKeyVisuals(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage = nullptr);
@@ -55,6 +64,8 @@ private:
     void closeDeviceLocked();
     void workerLoop();
     void setStatusLocked(const std::string& status);
+    void emitLogLocked(StreamDeckBackendLogLevel level, const std::string& message) const;
+    void emitLog(StreamDeckBackendLogLevel level, const std::string& message) const;
 
     std::string toUtf8Lossy(const wchar_t* value) const;
     std::string deviceErrorString(struct hid_device_* device) const;
@@ -64,6 +75,7 @@ private:
     std::thread readerThread_;
     std::atomic<bool> stopRequested_{false};
     StreamDeckKeyEventCallback eventCallback_;
+    StreamDeckBackendLogCallback logCallback_;
     StreamDeckInfo currentDeck_;
     std::vector<bool> lastKeyStates_;
     std::string statusLine_ = "Deck backend idle.";

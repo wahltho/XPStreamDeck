@@ -48,19 +48,37 @@ const SupportedProduct* findSupportedProduct(unsigned short productId) {
     return nullptr;
 }
 
-void resetKeyStream(hid_device* device) {
-    std::vector<unsigned char> payload(kImageResetReportLength, 0);
-    payload[0] = 0x02;
-    hid_write(device, payload.data(), payload.size());
+std::string hex16(unsigned short value) {
+    std::ostringstream out;
+    out << "0x" << std::hex << value;
+    return out.str();
 }
 
-void setBrightness(hid_device* device, int brightnessPercent) {
+bool resetKeyStream(hid_device* device, std::string* errorMessage) {
+    std::vector<unsigned char> payload(kImageResetReportLength, 0);
+    payload[0] = 0x02;
+    if (hid_write(device, payload.data(), payload.size()) < 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to reset key image stream.";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool setBrightness(hid_device* device, int brightnessPercent, std::string* errorMessage) {
     brightnessPercent = std::clamp(brightnessPercent, 0, 100);
     unsigned char payload[kFeatureReportLength] = {};
     payload[0] = 0x03;
     payload[1] = 0x08;
     payload[2] = static_cast<unsigned char>(brightnessPercent);
-    hid_send_feature_report(device, payload, sizeof(payload));
+    if (hid_send_feature_report(device, payload, sizeof(payload)) < 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to send brightness feature report.";
+        }
+        return false;
+    }
+    return true;
 }
 
 RgbColor backgroundForVisual(const StreamDeckKeyVisual& visual) {
@@ -127,29 +145,48 @@ void StreamDeckHidBackend::setEventCallback(StreamDeckKeyEventCallback callback)
     eventCallback_ = std::move(callback);
 }
 
+void StreamDeckHidBackend::setLogCallback(StreamDeckBackendLogCallback callback) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    logCallback_ = std::move(callback);
+}
+
 bool StreamDeckHidBackend::start(const std::string& preferredSerial, int brightnessPercent, std::string* errorMessage) {
+    emitLog(StreamDeckBackendLogLevel::Info,
+        "Start requested. preferred_serial=" + (preferredSerial.empty() ? std::string("<auto>") : preferredSerial) +
+        " brightness=" + std::to_string(std::clamp(brightnessPercent, 0, 100)) + "%");
     stop();
 
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (!openDeviceLocked(preferredSerial, brightnessPercent, errorMessage)) {
+            if (errorMessage != nullptr && !errorMessage->empty()) {
+                emitLogLocked(StreamDeckBackendLogLevel::Warn, "Start failed: " + *errorMessage);
+            }
             return false;
         }
         stopRequested_.store(false);
     }
 
     readerThread_ = std::thread(&StreamDeckHidBackend::workerLoop, this);
+    emitLog(StreamDeckBackendLogLevel::Debug, "Reader thread started.");
     return true;
 }
 
 void StreamDeckHidBackend::stop() {
+    emitLog(StreamDeckBackendLogLevel::Debug, "Stop requested.");
     stopRequested_.store(true);
 
     if (readerThread_.joinable()) {
+        emitLog(StreamDeckBackendLogLevel::Debug, "Joining reader thread.");
         readerThread_.join();
     }
 
     std::lock_guard<std::mutex> guard(mutex_);
+    if (currentDeck_.connected) {
+        emitLogLocked(StreamDeckBackendLogLevel::Info,
+            "Closing device " + currentDeck_.product_name +
+            (currentDeck_.serial.empty() ? std::string() : (" [" + currentDeck_.serial + "]")));
+    }
     closeDeviceLocked();
     if (!currentDeck_.connected) {
         statusLine_ = "Deck backend idle.";
@@ -158,6 +195,8 @@ void StreamDeckHidBackend::stop() {
 
 bool StreamDeckHidBackend::applyKeyVisuals(const std::vector<StreamDeckKeyVisual>& visuals, std::string* errorMessage) {
     std::lock_guard<std::mutex> guard(mutex_);
+    emitLogLocked(StreamDeckBackendLogLevel::Debug,
+        "Applying " + std::to_string(visuals.size()) + " key visual(s).");
     return applyKeyVisualsLocked(visuals, errorMessage);
 }
 
@@ -186,11 +225,21 @@ bool StreamDeckHidBackend::openDeviceLocked(const std::string& preferredSerial, 
     for (struct hid_device_info* current = devices; current != nullptr; current = current->next) {
         const SupportedProduct* supported = findSupportedProduct(current->product_id);
         if (supported == nullptr) {
+            emitLogLocked(StreamDeckBackendLogLevel::Debug,
+                "Ignoring unsupported Elgato product pid=" + hex16(current->product_id));
             continue;
         }
 
         const std::string serial = toUtf8Lossy(current->serial_number);
+        emitLogLocked(StreamDeckBackendLogLevel::Debug,
+            "Found candidate product=" +
+                std::string(current->product_string ? toUtf8Lossy(current->product_string) : supported->product_name) +
+                " serial=" + (serial.empty() ? std::string("<none>") : serial) +
+                " pid=" + hex16(current->product_id) +
+                " path=" + std::string(current->path ? current->path : "<null>"));
         if (!preferredSerial.empty() && serial != preferredSerial) {
+            emitLogLocked(StreamDeckBackendLogLevel::Debug,
+                "Skipping candidate due to serial mismatch. wanted=" + preferredSerial + " found=" + serial);
             continue;
         }
 
@@ -209,24 +258,45 @@ bool StreamDeckHidBackend::openDeviceLocked(const std::string& preferredSerial, 
             ? "No supported Stream Deck MK.2-family device detected."
             : "Configured Stream Deck serial not found.";
         setStatusLocked(message);
+        emitLogLocked(StreamDeckBackendLogLevel::Warn, message);
         if (errorMessage != nullptr) {
             *errorMessage = message;
         }
         return false;
     }
 
+    emitLogLocked(StreamDeckBackendLogLevel::Info,
+        "Opening device product=" + selected.product_name +
+        (selected.serial.empty() ? std::string() : (" [" + selected.serial + "]")) +
+        " pid=" + hex16(selected.product_id) +
+        " path=" + selected.path);
     device_ = hid_open_path(selected.path.c_str());
     if (device_ == nullptr) {
         const std::string message = "Failed to open Stream Deck: " + selected.path;
         setStatusLocked(message);
+        emitLogLocked(StreamDeckBackendLogLevel::Error, message);
         if (errorMessage != nullptr) {
             *errorMessage = message;
         }
         return false;
     }
 
-    resetKeyStream(device_);
-    setBrightness(device_, brightnessPercent);
+    std::string resetError;
+    if (!resetKeyStream(device_, &resetError)) {
+        emitLogLocked(StreamDeckBackendLogLevel::Warn,
+            resetError + " " + deviceErrorString(device_));
+    } else {
+        emitLogLocked(StreamDeckBackendLogLevel::Debug, "Key image stream reset.");
+    }
+
+    std::string brightnessError;
+    if (!setBrightness(device_, brightnessPercent, &brightnessError)) {
+        emitLogLocked(StreamDeckBackendLogLevel::Warn,
+            brightnessError + " " + deviceErrorString(device_));
+    } else {
+        emitLogLocked(StreamDeckBackendLogLevel::Debug,
+            "Brightness set to " + std::to_string(std::clamp(brightnessPercent, 0, 100)) + "%.");
+    }
 
     currentDeck_.connected = true;
     currentDeck_.path = selected.path;
@@ -243,6 +313,8 @@ bool StreamDeckHidBackend::openDeviceLocked(const std::string& preferredSerial, 
         status << " [" << currentDeck_.serial << "]";
     }
     setStatusLocked(status.str());
+    emitLogLocked(StreamDeckBackendLogLevel::Info,
+        "Device connected with " + std::to_string(currentDeck_.key_count) + " key(s).");
     return true;
 }
 
@@ -269,6 +341,13 @@ bool StreamDeckHidBackend::applyKeyVisualsLocked(const std::vector<StreamDeckKey
             visual = it->second;
         }
 
+        emitLogLocked(StreamDeckBackendLogLevel::Debug,
+            "Uploading key image for key." + std::to_string(index) +
+            " label='" + visual.label + "'" +
+            " bound=" + std::string(visual.has_binding ? "1" : "0") +
+            " resolved=" + std::string(visual.resolved ? "1" : "0") +
+            " hold=" + std::string(visual.hold_mode ? "1" : "0"));
+
         const auto background = backgroundForVisual(visual);
         const auto jpeg = renderLabelKeyJpeg(
             visual.label,
@@ -283,6 +362,7 @@ bool StreamDeckHidBackend::applyKeyVisualsLocked(const std::vector<StreamDeckKey
                 ? "Failed to upload key image."
                 : (writeError + " " + deviceErrorString(device_));
             setStatusLocked(message);
+            emitLogLocked(StreamDeckBackendLogLevel::Error, message);
             if (errorMessage != nullptr) {
                 *errorMessage = message;
             }
@@ -290,6 +370,7 @@ bool StreamDeckHidBackend::applyKeyVisualsLocked(const std::vector<StreamDeckKey
         }
     }
 
+    emitLogLocked(StreamDeckBackendLogLevel::Debug, "Key image upload complete.");
     return true;
 }
 
@@ -303,6 +384,7 @@ void StreamDeckHidBackend::closeDeviceLocked() {
 }
 
 void StreamDeckHidBackend::workerLoop() {
+    emitLog(StreamDeckBackendLogLevel::Debug, "Reader loop entered.");
     while (!stopRequested_.load()) {
         std::vector<unsigned char> report;
         std::vector<std::pair<int, bool>> changedKeys;
@@ -318,6 +400,8 @@ void StreamDeckHidBackend::workerLoop() {
             const int bytesRead = hid_read_timeout(device_, report.data(), report.size(), kReadTimeoutMs);
             if (bytesRead < 0) {
                 const std::string error = deviceErrorString(device_);
+                emitLogLocked(StreamDeckBackendLogLevel::Error,
+                    error.empty() ? "Deck disconnected or read failed." : ("Deck read failed: " + error));
                 closeDeviceLocked();
                 setStatusLocked(error.empty() ? "Deck disconnected or read failed." : ("Deck read failed: " + error));
                 break;
@@ -334,6 +418,8 @@ void StreamDeckHidBackend::workerLoop() {
                     continue;
                 }
                 lastKeyStates_[index] = pressed;
+                emitLogLocked(StreamDeckBackendLogLevel::Debug,
+                    "Key state changed key." + std::to_string(index) + "=" + (pressed ? std::string("pressed") : "released"));
                 changedKeys.emplace_back(static_cast<int>(index), pressed);
             }
         }
@@ -346,10 +432,22 @@ void StreamDeckHidBackend::workerLoop() {
             callback(keyIndex, pressed);
         }
     }
+    emitLog(StreamDeckBackendLogLevel::Debug, "Reader loop exited.");
 }
 
 void StreamDeckHidBackend::setStatusLocked(const std::string& status) {
     statusLine_ = status;
+}
+
+void StreamDeckHidBackend::emitLogLocked(StreamDeckBackendLogLevel level, const std::string& message) const {
+    if (logCallback_) {
+        logCallback_(level, message);
+    }
+}
+
+void StreamDeckHidBackend::emitLog(StreamDeckBackendLogLevel level, const std::string& message) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    emitLogLocked(level, message);
 }
 
 std::string StreamDeckHidBackend::toUtf8Lossy(const wchar_t* value) const {

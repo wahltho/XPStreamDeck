@@ -4,12 +4,15 @@
 #include <cctype>
 #include <string>
 
-inline void parseBool(const std::string& val, bool& out) {
+inline bool parseBool(const std::string& val, bool& out) {
     if (val == "1" || val == "true" || val == "TRUE" || val == "yes" || val == "on") {
         out = true;
+        return true;
     } else if (val == "0" || val == "false" || val == "FALSE" || val == "no" || val == "off") {
         out = false;
+        return true;
     }
+    return false;
 }
 
 inline std::string bool01(bool value) {
@@ -50,4 +53,3 @@ inline bool splitOnce(const std::string& s, char separator, std::string& left, s
     right = s.substr(pos + 1);
     return true;
 }
-

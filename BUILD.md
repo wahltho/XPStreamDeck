@@ -38,6 +38,16 @@ cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 -DXPLANE_SDK_ROOT=../.
 cmake --build build-win --config Release
 ```
 
+Alternative MinGW cross-build from macOS/Linux:
+```bash
+cmake -S . -B build-win -G Ninja \
+  -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+  -DXPLANE_SDK_ROOT=../../SDKs/XPlane_SDK
+cmake --build build-win --config Release
+```
+
 ## Staging
 ```bash
 mkdir -p deploy/XPStreamDeck/64
