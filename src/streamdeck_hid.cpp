@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -24,7 +26,7 @@ constexpr std::size_t kKeyImageHeaderLength = 8;
 constexpr std::size_t kKeyImageChunkLength = kKeyImageReportLength - kKeyImageHeaderLength;
 constexpr int kKeyImageWidth = 72;
 constexpr int kKeyImageHeight = 72;
-constexpr int kReadTimeoutMs = 50;
+constexpr int kIdlePollSleepMs = 5;
 
 struct SupportedProduct {
     unsigned short product_id = 0;
@@ -281,6 +283,18 @@ bool StreamDeckHidBackend::openDeviceLocked(const std::string& preferredSerial, 
         return false;
     }
 
+    if (hid_set_nonblocking(device_, 1) != 0) {
+        const std::string message = "Failed to switch Stream Deck to non-blocking read mode.";
+        setStatusLocked(message);
+        emitLogLocked(StreamDeckBackendLogLevel::Error, message + " " + deviceErrorString(device_));
+        closeDeviceLocked();
+        if (errorMessage != nullptr) {
+            *errorMessage = message;
+        }
+        return false;
+    }
+    emitLogLocked(StreamDeckBackendLogLevel::Debug, "Configured non-blocking HID polling.");
+
     std::string resetError;
     if (!resetKeyStream(device_, &resetError)) {
         emitLogLocked(StreamDeckBackendLogLevel::Warn,
@@ -389,6 +403,7 @@ void StreamDeckHidBackend::workerLoop() {
         std::vector<unsigned char> report;
         std::vector<std::pair<int, bool>> changedKeys;
         StreamDeckKeyEventCallback callback;
+        int bytesRead = 0;
 
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -397,7 +412,7 @@ void StreamDeckHidBackend::workerLoop() {
             }
 
             report.assign(kInputReportHeaderLength + currentDeck_.key_count, 0);
-            const int bytesRead = hid_read_timeout(device_, report.data(), report.size(), kReadTimeoutMs);
+            bytesRead = hid_read(device_, report.data(), report.size());
             if (bytesRead < 0) {
                 const std::string error = deviceErrorString(device_);
                 emitLogLocked(StreamDeckBackendLogLevel::Error,
@@ -407,21 +422,31 @@ void StreamDeckHidBackend::workerLoop() {
                 break;
             }
 
-            if (bytesRead == 0 || static_cast<std::size_t>(bytesRead) < (kInputReportHeaderLength + currentDeck_.key_count)) {
-                continue;
-            }
-
-            callback = eventCallback_;
-            for (std::size_t index = 0; index < currentDeck_.key_count; ++index) {
-                const bool pressed = report[kInputReportHeaderLength + index] != 0;
-                if (index >= lastKeyStates_.size() || lastKeyStates_[index] == pressed) {
-                    continue;
+            if (bytesRead == 0) {
+                callback = eventCallback_;
+            } else if (static_cast<std::size_t>(bytesRead) >= (kInputReportHeaderLength + currentDeck_.key_count)) {
+                callback = eventCallback_;
+                for (std::size_t index = 0; index < currentDeck_.key_count; ++index) {
+                    const bool pressed = report[kInputReportHeaderLength + index] != 0;
+                    if (index >= lastKeyStates_.size() || lastKeyStates_[index] == pressed) {
+                        continue;
+                    }
+                    lastKeyStates_[index] = pressed;
+                    emitLogLocked(StreamDeckBackendLogLevel::Debug,
+                        "Key state changed key." + std::to_string(index) + "=" + (pressed ? std::string("pressed") : "released"));
+                    changedKeys.emplace_back(static_cast<int>(index), pressed);
                 }
-                lastKeyStates_[index] = pressed;
+            } else {
                 emitLogLocked(StreamDeckBackendLogLevel::Debug,
-                    "Key state changed key." + std::to_string(index) + "=" + (pressed ? std::string("pressed") : "released"));
-                changedKeys.emplace_back(static_cast<int>(index), pressed);
+                    "Ignoring short input report bytes=" + std::to_string(bytesRead) +
+                    " expected>=" + std::to_string(kInputReportHeaderLength + currentDeck_.key_count));
+                callback = eventCallback_;
             }
+        }
+
+        if (bytesRead == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kIdlePollSleepMs));
+            continue;
         }
 
         if (!callback) {

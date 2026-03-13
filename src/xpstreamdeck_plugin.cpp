@@ -69,6 +69,7 @@ struct Prefs {
     bool enabled = true;
     bool logfileEnabled = true;
     bool debugLogging = false;
+    bool keyImagesEnabled = true;
     bool showWindowOnStart = false;
     bool hidAutoConnect = true;
     std::string activeProfile = "default";
@@ -350,6 +351,7 @@ std::string prefsSummary() {
     out << "enabled=" << bool01(g_prefs.enabled)
         << " logfile=" << bool01(g_prefs.logfileEnabled)
         << " debug=" << bool01(g_prefs.debugLogging)
+        << " key_images=" << bool01(g_prefs.keyImagesEnabled)
         << " show_window=" << bool01(g_prefs.showWindowOnStart)
         << " auto_connect=" << bool01(g_prefs.hidAutoConnect)
         << " profile=" << g_prefs.activeProfile
@@ -597,6 +599,7 @@ void savePrefs() {
         << "enabled=" << bool01(g_prefs.enabled) << '\n'
         << "logfile_enabled=" << bool01(g_prefs.logfileEnabled) << '\n'
         << "debug_logging=" << bool01(g_prefs.debugLogging) << '\n'
+        << "key_images_enabled=" << bool01(g_prefs.keyImagesEnabled) << '\n'
         << "show_window_on_start=" << bool01(g_prefs.showWindowOnStart) << '\n'
         << "hid_auto_connect=" << bool01(g_prefs.hidAutoConnect) << '\n'
         << "active_profile=" << g_prefs.activeProfile << '\n'
@@ -651,6 +654,10 @@ void loadPrefs() {
         } else if (key == "debug_logging") {
             if (!parseBool(value, g_prefs.debugLogging)) {
                 logWarn("prefs", "Invalid boolean for debug_logging on line " + std::to_string(lineNumber) + ": " + value);
+            }
+        } else if (key == "key_images_enabled") {
+            if (!parseBool(value, g_prefs.keyImagesEnabled)) {
+                logWarn("prefs", "Invalid boolean for key_images_enabled on line " + std::to_string(lineNumber) + ": " + value);
             }
         } else if (key == "show_window_on_start") {
             if (!parseBool(value, g_prefs.showWindowOnStart)) {
@@ -935,6 +942,11 @@ std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
 }
 
 void refreshDeckKeyImages() {
+    if (!g_prefs.keyImagesEnabled) {
+        logInfo("deck", "Key image upload disabled in prefs.");
+        return;
+    }
+
     const auto deck = g_deckBackend.currentDeck();
     if (!deck.connected) {
         logDebug("deck", "Skipping key image refresh because no deck is connected.");
@@ -1362,7 +1374,9 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     y -= step;
     drawTextLine(x, y, "Brightness: " + std::to_string(g_prefs.brightness) + "%  Auto-connect: " + std::string(g_prefs.hidAutoConnect ? "on" : "off"));
     y -= step;
-    drawTextLine(x, y, "Logging: file=" + boolOnOff(g_prefs.logfileEnabled) + " debug=" + boolOnOff(g_prefs.debugLogging) + " queued=" + std::to_string(pendingLogCount()));
+    drawTextLine(x, y, "Deck images: " + boolOnOff(g_prefs.keyImagesEnabled) + "  Logging: file=" + boolOnOff(g_prefs.logfileEnabled) + " debug=" + boolOnOff(g_prefs.debugLogging));
+    y -= step;
+    drawTextLine(x, y, "Queued logs: " + std::to_string(pendingLogCount()));
     y -= step;
     drawTextLine(x, y, "Last key event: " + ellipsizeMiddle(g_lastKeyEventLine, 78));
     y -= step;

@@ -10,6 +10,7 @@ Current state:
 - Native X-Plane command dispatch scaffold for `once` and `hold` actions.
 - Native HID backend for Stream Deck MK.2-family 15-key devices.
 - Worker-thread key polling with handoff into the X-Plane flight loop.
+- Non-blocking HID polling to avoid stalling the X-Plane main thread.
 - Native key-image upload with rendered text labels on the Stream Deck buttons.
 - Automatic reconnect after disconnect or late device attach.
 - Aircraft-specific profile selection via exact tailnum matching with fallback profile.
@@ -31,6 +32,7 @@ Current state:
 ## Logging
 - Normal logging writes `ERROR`, `WARN`, and `INFO`.
 - `DEBUG` logging is enabled with `debug_logging=1` in `XPStreamDeck.prf`.
+- Key-image upload can be disabled with `key_images_enabled=0` while keeping deck input and command dispatch active.
 - Logs go to both `XPLMDebugString` and `log/xpstreamdeck.log` when `logfile_enabled=1`.
 - The plugin now logs prefs parsing, profile scanning/parsing, tailnum selection, HID connect/reconnect, key-image upload, key events, and command dispatch.
 
@@ -40,6 +42,7 @@ Example `XPStreamDeck.prf`:
 enabled=1
 logfile_enabled=1
 debug_logging=0
+key_images_enabled=1
 show_window_on_start=0
 hid_auto_connect=1
 active_profile=default
