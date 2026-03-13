@@ -17,6 +17,8 @@ std::vector<unsigned char> renderLabelKeyJpeg(
     int width,
     int height,
     RgbColor background,
-    RgbColor foreground);
+    RgbColor foreground,
+    RgbColor accent,
+    int maxTextScale = 0);
 
 } // namespace xpstreamdeck

@@ -9,6 +9,7 @@
 #include "XPLMUtilities.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <chrono>
@@ -38,6 +39,7 @@ constexpr int kWindowHeight = 390;
 constexpr float kFlightLoopInterval = 0.05f;
 constexpr float kDeckReconnectRetrySeconds = 2.0f;
 constexpr float kProfileRetrySeconds = 5.0f;
+constexpr float kPulseDurationSeconds = 0.08f;
 
 enum class InternalCommand {
     ToggleWindow,
@@ -56,6 +58,7 @@ InternalCommand decodeCommandRefcon(void* refcon) {
 enum class ActionMode {
     Once,
     Hold,
+    Pulse,
 };
 
 enum class LogLevel {
@@ -101,6 +104,18 @@ struct ActionBinding {
     ActionMode mode = ActionMode::Once;
     XPLMCommandRef command = nullptr;
     bool active = false;
+    float pulseEndAt = 0.0f;
+};
+
+struct KeyStyle {
+    bool hasTextScale = false;
+    int textScale = 0;
+    bool hasBackground = false;
+    xpstreamdeck::RgbColor background{};
+    bool hasForeground = false;
+    xpstreamdeck::RgbColor foreground{};
+    bool hasAccent = false;
+    xpstreamdeck::RgbColor accent{};
 };
 
 struct PendingKeyEvent {
@@ -119,6 +134,7 @@ Prefs g_prefs;
 Paths g_paths;
 std::vector<ActionBinding> g_bindings;
 std::map<int, std::string> g_keyLabels;
+std::map<int, KeyStyle> g_keyStyles;
 std::ofstream g_logFile;
 std::mutex g_logMutex;
 std::deque<PendingLogEntry> g_pendingLogEntries;
@@ -198,6 +214,104 @@ std::string unescapeProfileText(const std::string& text) {
         out.push_back('\\');
     }
     return out;
+}
+
+std::string rgbColorToHex(const xpstreamdeck::RgbColor& color) {
+    char buffer[16] = {};
+    std::snprintf(buffer, sizeof(buffer), "#%02X%02X%02X", color.r, color.g, color.b);
+    return std::string(buffer);
+}
+
+bool tryParseHexColor(const std::string& value, xpstreamdeck::RgbColor& out) {
+    if (value.size() != 6) {
+        return false;
+    }
+
+    auto hexByte = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+            return ch - '0';
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return 10 + (ch - 'a');
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            return 10 + (ch - 'A');
+        }
+        return -1;
+    };
+
+    std::array<int, 6> digits{};
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        digits[i] = hexByte(value[i]);
+        if (digits[i] < 0) {
+            return false;
+        }
+    }
+
+    out.r = static_cast<std::uint8_t>((digits[0] << 4) | digits[1]);
+    out.g = static_cast<std::uint8_t>((digits[2] << 4) | digits[3]);
+    out.b = static_cast<std::uint8_t>((digits[4] << 4) | digits[5]);
+    return true;
+}
+
+bool tryParseRgbColor(const std::string& raw, xpstreamdeck::RgbColor& out) {
+    std::string value = trimString(raw);
+    if (value.empty()) {
+        return false;
+    }
+
+    if (!value.empty() && value.front() == '#') {
+        value.erase(value.begin());
+    }
+    if (tryParseHexColor(value, out)) {
+        return true;
+    }
+
+    std::string normalized = toLowerCopy(trimString(raw));
+    static const std::array<std::pair<const char*, xpstreamdeck::RgbColor>, 12> kNamedColors = {{
+        {"white", {245, 247, 250}},
+        {"black", {10, 14, 20}},
+        {"gray", {62, 70, 82}},
+        {"grey", {62, 70, 82}},
+        {"slate", {47, 76, 120}},
+        {"blue", {36, 93, 168}},
+        {"cyan", {36, 128, 156}},
+        {"teal", {33, 120, 114}},
+        {"green", {36, 118, 76}},
+        {"amber", {130, 88, 32}},
+        {"orange", {154, 82, 28}},
+        {"red", {120, 36, 36}},
+    }};
+    for (const auto& [name, color] : kNamedColors) {
+        if (normalized == name) {
+            out = color;
+            return true;
+        }
+    }
+
+    std::string first;
+    std::string second;
+    std::string third;
+    if (splitOnce(value, ',', first, second) && splitOnce(second, ',', second, third)) {
+        try {
+            const int r = std::stoi(trimString(first));
+            const int g = std::stoi(trimString(second));
+            const int b = std::stoi(trimString(third));
+            if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
+                return false;
+            }
+            out = {
+                static_cast<std::uint8_t>(r),
+                static_cast<std::uint8_t>(g),
+                static_cast<std::uint8_t>(b),
+            };
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    return false;
 }
 
 std::string defaultLabelFromCommandPath(const std::string& commandPath) {
@@ -362,13 +476,56 @@ std::string prefsSummary() {
 
 std::string bindingSummary(const ActionBinding& binding) {
     std::ostringstream out;
+    const char* modeName = "once";
+    switch (binding.mode) {
+    case ActionMode::Hold:
+        modeName = "hold";
+        break;
+    case ActionMode::Pulse:
+        modeName = "pulse";
+        break;
+    case ActionMode::Once:
+    default:
+        break;
+    }
     out << "key." << binding.keyIndex
         << " command=" << binding.commandPath
-        << " mode=" << (binding.mode == ActionMode::Hold ? "hold" : "once")
+        << " mode=" << modeName
         << " label='" << binding.label << "'"
         << " resolved=" << (binding.command != nullptr ? "1" : "0")
         << " active=" << (binding.active ? "1" : "0");
     return out.str();
+}
+
+std::string keyStyleSummary(const KeyStyle& style) {
+    std::ostringstream out;
+    bool wrote = false;
+    if (style.hasTextScale) {
+        out << "text_scale=" << style.textScale;
+        wrote = true;
+    }
+    if (style.hasBackground) {
+        if (wrote) {
+            out << ' ';
+        }
+        out << "bg=" << rgbColorToHex(style.background);
+        wrote = true;
+    }
+    if (style.hasForeground) {
+        if (wrote) {
+            out << ' ';
+        }
+        out << "fg=" << rgbColorToHex(style.foreground);
+        wrote = true;
+    }
+    if (style.hasAccent) {
+        if (wrote) {
+            out << ' ';
+        }
+        out << "accent=" << rgbColorToHex(style.accent);
+        wrote = true;
+    }
+    return wrote ? out.str() : std::string("<default>");
 }
 
 std::size_t pendingLogCount() {
@@ -443,17 +600,26 @@ void writeDefaultProfileIfMissing() {
         << "profile_id=default\n"
         << "# key.<index>=<command>|<mode>\n"
         << "# label.<index>=TEXT or TEXT\\nTEXT\n"
-        << "# mode: once | hold\n"
+        << "# text_scale.<index>=1..6 (caps auto text size)\n"
+        << "# bg.<index>=#RRGGBB or named-color\n"
+        << "# fg.<index>=#RRGGBB or named-color\n"
+        << "# accent.<index>=#RRGGBB or named-color\n"
+        << "# mode: once | hold | pulse\n"
         << '\n'
         << "label.0=PAUSE\n"
+        << "bg.0=#4A4F57\n"
         << "key.0=sim/operation/pause_toggle|once\n"
         << "label.1=FLAPS\\nDOWN\n"
+        << "bg.1=#815820\n"
         << "key.1=sim/flight_controls/flaps_down|once\n"
         << "label.2=FLAPS\\nUP\n"
+        << "bg.2=#815820\n"
         << "key.2=sim/flight_controls/flaps_up|once\n"
         << "label.3=BRAKES\n"
+        << "bg.3=#7A2F2F\n"
         << "key.3=sim/flight_controls/brakes_toggle_max|once\n"
         << "label.4=REV\\nHOLD\n"
+        << "bg.4=#815820\n"
         << "key.4=sim/engines/thrust_reverse_hold|hold\n";
     logInfo("profile", "Created default profile: " + pathToDisplay(g_paths.fallbackProfileFile));
 }
@@ -722,6 +888,10 @@ bool tryParseActionMode(const std::string& raw, ActionMode& out) {
         out = ActionMode::Hold;
         return true;
     }
+    if (normalized == "pulse") {
+        out = ActionMode::Pulse;
+        return true;
+    }
     return false;
 }
 
@@ -729,6 +899,8 @@ const char* actionModeName(ActionMode mode) {
     switch (mode) {
     case ActionMode::Hold:
         return "hold";
+    case ActionMode::Pulse:
+        return "pulse";
     case ActionMode::Once:
     default:
         return "once";
@@ -753,13 +925,14 @@ void handleDeckBackendLog(xpstreamdeck::StreamDeckBackendLogLevel level, const s
     logMessage(mapBackendLogLevel(level), "deck-hid", message);
 }
 
-void releaseHeldBindings() {
+void releaseActiveBindings() {
     for (auto& binding : g_bindings) {
         if (binding.active && binding.command != nullptr) {
             XPLMCommandEnd(binding.command);
-            logDebug("dispatch", "Released held binding during cleanup: " + bindingSummary(binding));
+            logDebug("dispatch", "Released active binding during cleanup: " + bindingSummary(binding));
             binding.active = false;
         }
+        binding.pulseEndAt = 0.0f;
     }
 }
 
@@ -777,6 +950,7 @@ void resolveBindings() {
     for (auto& binding : g_bindings) {
         binding.command = XPLMFindCommand(binding.commandPath.c_str());
         binding.active = false;
+        binding.pulseEndAt = 0.0f;
         if (binding.label.empty()) {
             binding.label = defaultLabelFromCommandPath(binding.commandPath);
         }
@@ -795,9 +969,10 @@ void resolveBindings() {
 }
 
 void loadProfile() {
-    releaseHeldBindings();
+    releaseActiveBindings();
     g_bindings.clear();
     g_keyLabels.clear();
+    g_keyStyles.clear();
 
     logInfo("profile", "Loading profile from " + pathToDisplay(g_paths.activeProfileFile));
 
@@ -812,6 +987,10 @@ void loadProfile() {
     int lineNumber = 0;
     std::map<int, int> bindingLineByKey;
     std::map<int, int> labelLineByKey;
+    std::map<int, int> textScaleLineByKey;
+    std::map<int, int> bgLineByKey;
+    std::map<int, int> fgLineByKey;
+    std::map<int, int> accentLineByKey;
     while (std::getline(in, line)) {
         ++lineNumber;
         line = trimString(line);
@@ -834,28 +1013,111 @@ void loadProfile() {
                 logDebug("profile", "Ignoring metadata directive '" + lhs + "' on line " + std::to_string(lineNumber));
                 continue;
             }
-            if (lhs.rfind("label.", 0) != 0) {
+            if (lhs.rfind("label.", 0) == 0) {
+                const std::string indexString = lhs.substr(6);
+                int keyIndex = -1;
+                try {
+                    keyIndex = std::stoi(indexString);
+                } catch (...) {
+                    logWarn("profile", "Invalid label index in profile on line " + std::to_string(lineNumber) + ": " + indexString);
+                    continue;
+                }
+
+                if (const auto existing = labelLineByKey.find(keyIndex); existing != labelLineByKey.end()) {
+                    logWarn("profile", "Duplicate label for key." + std::to_string(keyIndex) + " on line " + std::to_string(lineNumber) +
+                        " (previous line " + std::to_string(existing->second) + ")");
+                }
+                g_keyLabels[keyIndex] = unescapeProfileText(rhs);
+                labelLineByKey[keyIndex] = lineNumber;
+                logDebug("profile", "Parsed label key." + std::to_string(keyIndex) + "='" + g_keyLabels[keyIndex] + "'");
+                continue;
+            }
+
+            if (lhs.rfind("text_scale.", 0) == 0) {
+                const std::string indexString = lhs.substr(11);
+                int keyIndex = -1;
+                try {
+                    keyIndex = std::stoi(indexString);
+                } catch (...) {
+                    logWarn("profile", "Invalid text_scale index in profile on line " + std::to_string(lineNumber) + ": " + indexString);
+                    continue;
+                }
+
+                int textScale = 0;
+                try {
+                    textScale = std::stoi(rhs);
+                } catch (...) {
+                    logWarn("profile", "Invalid text_scale value '" + rhs + "' for key." + std::to_string(keyIndex) +
+                        " on line " + std::to_string(lineNumber));
+                    continue;
+                }
+                if (textScale < 1 || textScale > 6) {
+                    logWarn("profile", "text_scale for key." + std::to_string(keyIndex) +
+                        " on line " + std::to_string(lineNumber) + " must be between 1 and 6");
+                    continue;
+                }
+
+                if (const auto existing = textScaleLineByKey.find(keyIndex); existing != textScaleLineByKey.end()) {
+                    logWarn("profile", "Duplicate text_scale for key." + std::to_string(keyIndex) + " on line " + std::to_string(lineNumber) +
+                        " (previous line " + std::to_string(existing->second) + ")");
+                }
+
+                auto& style = g_keyStyles[keyIndex];
+                style.hasTextScale = true;
+                style.textScale = textScale;
+                textScaleLineByKey[keyIndex] = lineNumber;
+                logDebug("profile", "Parsed text_scale key." + std::to_string(keyIndex) + "=" + std::to_string(textScale));
+                continue;
+            }
+
+            auto parseStyleDirective = [&](const char* directiveName,
+                                           const std::string& prefix,
+                                           std::map<int, int>& lineMap,
+                                           bool KeyStyle::* flagMember,
+                                           xpstreamdeck::RgbColor KeyStyle::* colorMember) -> bool {
+                if (lhs.rfind(prefix, 0) != 0) {
+                    return false;
+                }
+
+                const std::string indexString = lhs.substr(prefix.size());
+                int keyIndex = -1;
+                try {
+                    keyIndex = std::stoi(indexString);
+                } catch (...) {
+                    logWarn("profile", "Invalid " + std::string(directiveName) + " index in profile on line " + std::to_string(lineNumber) + ": " + indexString);
+                    return true;
+                }
+
+                xpstreamdeck::RgbColor color;
+                if (!tryParseRgbColor(rhs, color)) {
+                    logWarn("profile", "Invalid color '" + rhs + "' for " + std::string(directiveName) + " key." + std::to_string(keyIndex) +
+                        " on line " + std::to_string(lineNumber));
+                    return true;
+                }
+
+                if (const auto existing = lineMap.find(keyIndex); existing != lineMap.end()) {
+                    logWarn("profile", "Duplicate " + std::string(directiveName) + " for key." + std::to_string(keyIndex) +
+                        " on line " + std::to_string(lineNumber) + " (previous line " + std::to_string(existing->second) + ")");
+                }
+
+                auto& style = g_keyStyles[keyIndex];
+                style.*flagMember = true;
+                style.*colorMember = color;
+                lineMap[keyIndex] = lineNumber;
+                logDebug("profile", "Parsed " + std::string(directiveName) + " key." + std::to_string(keyIndex) + "=" + rgbColorToHex(color));
+                return true;
+            };
+
+            if (parseStyleDirective("bg", "bg.", bgLineByKey, &KeyStyle::hasBackground, &KeyStyle::background) ||
+                parseStyleDirective("fg", "fg.", fgLineByKey, &KeyStyle::hasForeground, &KeyStyle::foreground) ||
+                parseStyleDirective("accent", "accent.", accentLineByKey, &KeyStyle::hasAccent, &KeyStyle::accent)) {
+                continue;
+            }
+
+            {
                 logWarn("profile", "Ignoring unknown profile directive '" + lhs + "' on line " + std::to_string(lineNumber));
                 continue;
             }
-
-            const std::string indexString = lhs.substr(6);
-            int keyIndex = -1;
-            try {
-                keyIndex = std::stoi(indexString);
-            } catch (...) {
-                logWarn("profile", "Invalid label index in profile on line " + std::to_string(lineNumber) + ": " + indexString);
-                continue;
-            }
-
-            if (const auto existing = labelLineByKey.find(keyIndex); existing != labelLineByKey.end()) {
-                logWarn("profile", "Duplicate label for key." + std::to_string(keyIndex) + " on line " + std::to_string(lineNumber) +
-                    " (previous line " + std::to_string(existing->second) + ")");
-            }
-            g_keyLabels[keyIndex] = unescapeProfileText(rhs);
-            labelLineByKey[keyIndex] = lineNumber;
-            logDebug("profile", "Parsed label key." + std::to_string(keyIndex) + "='" + g_keyLabels[keyIndex] + "'");
-            continue;
         }
 
         const std::string indexString = lhs.substr(4);
@@ -906,12 +1168,26 @@ void loadProfile() {
         }
     }
 
+    for (const auto& [keyIndex, style] : g_keyStyles) {
+        logDebug("profile", "Parsed style key." + std::to_string(keyIndex) + " " + keyStyleSummary(style));
+    }
+
     resolveBindings();
     logInfo("profile", "Active profile: " + g_activeProfileName + " [" + g_activeProfileSource + "] (" + pathToDisplay(g_paths.activeProfileFile) + ")");
 }
 
 std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
     std::map<int, xpstreamdeck::StreamDeckKeyVisual> visuals;
+
+    auto applyStyle = [](xpstreamdeck::StreamDeckKeyVisual& visual, const KeyStyle& style) {
+        visual.max_text_scale = style.hasTextScale ? style.textScale : 0;
+        visual.has_background = style.hasBackground;
+        visual.background = style.background;
+        visual.has_foreground = style.hasForeground;
+        visual.foreground = style.foreground;
+        visual.has_accent = style.hasAccent;
+        visual.accent = style.accent;
+    };
 
     for (const auto& [keyIndex, label] : g_keyLabels) {
         auto& visual = visuals[keyIndex];
@@ -922,6 +1198,12 @@ std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
         visual.hold_mode = false;
     }
 
+    for (const auto& [keyIndex, style] : g_keyStyles) {
+        auto& visual = visuals[keyIndex];
+        visual.key_index = keyIndex;
+        applyStyle(visual, style);
+    }
+
     for (const auto& binding : g_bindings) {
         auto& visual = visuals[binding.keyIndex];
         visual.key_index = binding.keyIndex;
@@ -929,6 +1211,9 @@ std::vector<xpstreamdeck::StreamDeckKeyVisual> buildDeckKeyVisuals() {
         visual.has_binding = true;
         visual.resolved = binding.command != nullptr;
         visual.hold_mode = binding.mode == ActionMode::Hold;
+        if (const auto styleIt = g_keyStyles.find(binding.keyIndex); styleIt != g_keyStyles.end()) {
+            applyStyle(visual, styleIt->second);
+        }
     }
 
     std::vector<xpstreamdeck::StreamDeckKeyVisual> ordered;
@@ -1168,14 +1453,46 @@ void dispatchBinding(ActionBinding& binding, bool pressed) {
             if (!binding.active) {
                 XPLMCommandBegin(binding.command);
                 binding.active = true;
+                binding.pulseEndAt = 0.0f;
                 logDebug("dispatch", "Began hold command: " + bindingSummary(binding));
             }
         } else if (binding.active) {
             XPLMCommandEnd(binding.command);
             binding.active = false;
+            binding.pulseEndAt = 0.0f;
             logDebug("dispatch", "Ended hold command: " + bindingSummary(binding));
         }
         break;
+    case ActionMode::Pulse:
+        if (pressed) {
+            const float now = XPLMGetElapsedTime();
+            if (!binding.active) {
+                XPLMCommandBegin(binding.command);
+                binding.active = true;
+                logDebug("dispatch", "Began pulse command: " + bindingSummary(binding));
+            } else {
+                logDebug("dispatch", "Extended pulse command: " + bindingSummary(binding));
+            }
+            binding.pulseEndAt = now + kPulseDurationSeconds;
+        }
+        break;
+    }
+}
+
+void maintainPulseBindings() {
+    const float now = XPLMGetElapsedTime();
+    for (auto& binding : g_bindings) {
+        if (binding.mode != ActionMode::Pulse || !binding.active || binding.command == nullptr) {
+            continue;
+        }
+        if (binding.pulseEndAt <= 0.0f || now < binding.pulseEndAt) {
+            continue;
+        }
+
+        XPLMCommandEnd(binding.command);
+        binding.active = false;
+        binding.pulseEndAt = 0.0f;
+        logDebug("dispatch", "Ended pulse command: " + bindingSummary(binding));
     }
 }
 
@@ -1221,7 +1538,7 @@ void maintainDeckBackend() {
     if (g_deckWasConnected) {
         g_deckWasConnected = false;
         clearPendingKeyEvents();
-        releaseHeldBindings();
+        releaseActiveBindings();
         g_lastKeyEventLine = "Deck disconnected.";
         logWarn("deck", "Stream Deck disconnected. backend_status=" + g_deckBackend.statusLine());
         scheduleDeckReconnect(now, "Stream Deck disconnected.");
@@ -1262,6 +1579,7 @@ float flightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceL
     (void)inRefcon;
     flushPendingLogEntries();
     processPendingKeyEvents();
+    maintainPulseBindings();
     maintainDeckBackend();
     maintainProfileSelection();
     flushPendingLogEntries();
@@ -1398,9 +1716,9 @@ void drawWindow(XPLMWindowID inWindowID, void* inRefcon) {
     y -= step * 2;
     drawTextLine(x, y, "Profile syntax: key.<index>=<command>|<mode>");
     y -= step;
-    drawTextLine(x, y, "Label syntax: label.<index>=TEXT or TEXT\\nTEXT");
+    drawTextLine(x, y, "Profile syntax: label./key./bg./fg./accent.<index>=...");
     y -= step;
-    drawTextLine(x, y, "Supported modes: once, hold");
+    drawTextLine(x, y, "Supported modes: once, hold, pulse");
 }
 
 int handleMouseClick(XPLMWindowID inWindowID, int x, int y, XPLMMouseStatus inMouse, void* inRefcon) {
@@ -1591,7 +1909,7 @@ PLUGIN_API void XPluginStop(void) {
     logInfo("lifecycle", "Stopping plugin.");
     g_pluginCurrentlyEnabled = false;
     stopDeckBackend();
-    releaseHeldBindings();
+    releaseActiveBindings();
     flushPendingLogEntries();
     unregisterFlightLoop();
     destroyWindow();
@@ -1616,7 +1934,7 @@ PLUGIN_API int XPluginEnable(void) {
 PLUGIN_API void XPluginDisable(void) {
     g_pluginCurrentlyEnabled = false;
     stopDeckBackend();
-    releaseHeldBindings();
+    releaseActiveBindings();
     flushPendingLogEntries();
     logInfo("lifecycle", "Plugin disabled.");
 }

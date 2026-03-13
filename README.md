@@ -12,6 +12,7 @@ Current state:
 - Worker-thread key polling with handoff into the X-Plane flight loop.
 - Non-blocking HID polling to avoid stalling the X-Plane main thread.
 - Native key-image upload with rendered text labels on the Stream Deck buttons.
+- Denser key-label rendering with tighter glyph spacing and smaller fallback scales.
 - Automatic reconnect after disconnect or late device attach.
 - Aircraft-specific profile selection via exact tailnum matching with fallback profile.
 - Debug-log toggle via prefs for high-detail field diagnostics.
@@ -78,26 +79,39 @@ Current syntax:
 # profile_id=<name>
 # tailnum=<exact-tail-number>
 # label.<index>=TEXT or TEXT\nTEXT
+# text_scale.<index>=1..6 (caps auto text size)
+# bg.<index>=#RRGGBB or named-color
+# fg.<index>=#RRGGBB or named-color
+# accent.<index>=#RRGGBB or named-color
 # key.<index>=<command>|<mode>
 profile_id=default
 label.0=PAUSE
+bg.0=#4A4F57
 key.0=sim/operation/pause_toggle|once
 label.1=FLAPS\nDOWN
+bg.1=#815820
 key.1=sim/flight_controls/flaps_down|once
 label.2=FLAPS\nUP
+bg.2=#815820
 key.2=sim/flight_controls/flaps_up|once
 label.3=BRAKES
+bg.3=#7A2F2F
 key.3=sim/flight_controls/brakes_toggle_max|once
 label.4=REV\nHOLD
+bg.4=#815820
 key.4=sim/engines/thrust_reverse_hold|hold
 ```
 
 Supported modes:
 - `once`
 - `hold`
+- `pulse`
 
 `label.<index>` drives the text rendered onto the corresponding Stream Deck key.
 Use `\n` for a manual line break.
+`text_scale.<index>` caps the automatic text scale for one key. `text_scale.7=1` is a good escape hatch for short labels that would otherwise render too large.
+`bg.<index>`, `fg.<index>` and `accent.<index>` override the per-key colors. Supported color forms are `#RRGGBB`, `RRGGBB`, `r,g,b`, or named colors such as `blue`, `amber`, `green`, `gray`, `white`, `black`.
+`pulse` sends `XPLMCommandBegin()` on press and `XPLMCommandEnd()` automatically after a short fixed pulse of about 80 ms.
 `tailnum=` can be repeated and is matched exactly and case-sensitively against `sim/aircraft/view/acf_tailnum`.
 If no aircraft-specific profile matches, the plugin falls back to the profile named in `active_profile`.
 

@@ -84,6 +84,9 @@ bool setBrightness(hid_device* device, int brightnessPercent, std::string* error
 }
 
 RgbColor backgroundForVisual(const StreamDeckKeyVisual& visual) {
+    if (visual.has_background) {
+        return visual.background;
+    }
     if (!visual.has_binding) {
         return {44, 48, 54};
     }
@@ -94,6 +97,29 @@ RgbColor backgroundForVisual(const StreamDeckKeyVisual& visual) {
         return {133, 78, 24};
     }
     return {25, 61, 117};
+}
+
+RgbColor foregroundForVisual(const StreamDeckKeyVisual& visual) {
+    if (visual.has_foreground) {
+        return visual.foreground;
+    }
+    return {245, 247, 250};
+}
+
+RgbColor accentForVisual(const StreamDeckKeyVisual& visual) {
+    if (visual.has_accent) {
+        return visual.accent;
+    }
+    if (!visual.has_binding) {
+        return {99, 109, 122};
+    }
+    if (!visual.resolved) {
+        return {190, 82, 82};
+    }
+    if (visual.hold_mode) {
+        return {214, 156, 82};
+    }
+    return {78, 145, 224};
 }
 
 bool writeKeyImage(hid_device* device, int keyIndex, const std::vector<unsigned char>& jpeg, std::string* errorMessage) {
@@ -360,15 +386,20 @@ bool StreamDeckHidBackend::applyKeyVisualsLocked(const std::vector<StreamDeckKey
             " label='" + visual.label + "'" +
             " bound=" + std::string(visual.has_binding ? "1" : "0") +
             " resolved=" + std::string(visual.resolved ? "1" : "0") +
-            " hold=" + std::string(visual.hold_mode ? "1" : "0"));
+            " hold=" + std::string(visual.hold_mode ? "1" : "0") +
+            " max_text_scale=" + std::to_string(visual.max_text_scale));
 
         const auto background = backgroundForVisual(visual);
+        const auto foreground = foregroundForVisual(visual);
+        const auto accent = accentForVisual(visual);
         const auto jpeg = renderLabelKeyJpeg(
             visual.label,
             kKeyImageWidth,
             kKeyImageHeight,
             background,
-            {245, 247, 250});
+            foreground,
+            accent,
+            visual.max_text_scale);
 
         std::string writeError;
         if (!writeKeyImage(device_, static_cast<int>(index), jpeg, &writeError)) {

@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "key_label_renderer.h"
+
 struct hid_device_;
 
 namespace xpstreamdeck {
@@ -29,6 +31,13 @@ struct StreamDeckKeyVisual {
     bool has_binding = false;
     bool resolved = false;
     bool hold_mode = false;
+    int max_text_scale = 0;
+    bool has_background = false;
+    RgbColor background;
+    bool has_foreground = false;
+    RgbColor foreground;
+    bool has_accent = false;
+    RgbColor accent;
 };
 
 enum class StreamDeckBackendLogLevel {
