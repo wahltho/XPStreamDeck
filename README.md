@@ -7,7 +7,7 @@ Current state:
 - Plugin menu, commands, prefs, log file, status window.
 - Structured logging with `ERROR`/`WARN`/`INFO`/`DEBUG` levels.
 - Profile loader for simple key-to-command mappings.
-- Native X-Plane command dispatch scaffold for `once` and `hold` actions.
+- Native X-Plane command dispatch scaffold for `once`, `hold`, and `pulse` actions.
 - Native HID backend for Stream Deck MK.2-family 15-key devices.
 - Worker-thread key polling with handoff into the X-Plane flight loop.
 - Non-blocking HID polling to avoid stalling the X-Plane main thread.
@@ -132,4 +132,4 @@ See `BUILD.md`.
 ## Next Steps
 - Add state-driven key styles and active/inactive feedback.
 - Expand beyond the current MK.2-family 15-key protocol.
-- Expand profile actions beyond `once` and `hold`.
+- Expand profile actions beyond the current `once`/`hold`/`pulse` set.
