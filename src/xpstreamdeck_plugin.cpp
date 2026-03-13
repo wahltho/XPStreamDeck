@@ -1428,7 +1428,6 @@ void reloadRuntimeConfig() {
     loadProfileCandidates();
     reopenLogFile();
     selectProfileForAircraft(false);
-    g_windowVisible = g_prefs.showWindowOnStart || g_windowVisible;
     applyWindowVisibility();
     reconfigureDeckBackend();
     logInfo("prefs", "Prefs reloaded from " + pathToDisplay(g_paths.prefsFile));
