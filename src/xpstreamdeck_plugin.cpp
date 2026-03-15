@@ -40,6 +40,7 @@ constexpr float kFlightLoopInterval = 0.05f;
 constexpr float kDeckReconnectRetrySeconds = 2.0f;
 constexpr float kProfileRetrySeconds = 5.0f;
 constexpr float kPulseDurationSeconds = 0.08f;
+constexpr float kBindingResolveRetrySeconds = 1.0f;
 
 enum class InternalCommand {
     ToggleWindow,
@@ -105,6 +106,7 @@ struct ActionBinding {
     XPLMCommandRef command = nullptr;
     bool active = false;
     float pulseEndAt = 0.0f;
+    float lastResolveAttemptAt = 0.0f;
 };
 
 struct KeyStyle {
@@ -951,6 +953,7 @@ void resolveBindings() {
         binding.command = XPLMFindCommand(binding.commandPath.c_str());
         binding.active = false;
         binding.pulseEndAt = 0.0f;
+        binding.lastResolveAttemptAt = XPLMGetElapsedTime();
         if (binding.label.empty()) {
             binding.label = defaultLabelFromCommandPath(binding.commandPath);
         }
@@ -966,6 +969,27 @@ void resolveBindings() {
     summary << "Loaded " << g_bindings.size() << " binding(s), resolved " << g_resolvedBindings << '.';
     g_statusLine = summary.str();
     logInfo("profile", g_statusLine);
+}
+
+bool tryResolveBindingAtRuntime(ActionBinding& binding) {
+    if (binding.command != nullptr) {
+        return true;
+    }
+
+    const float now = XPLMGetElapsedTime();
+    if (binding.lastResolveAttemptAt > 0.0f && (now - binding.lastResolveAttemptAt) < kBindingResolveRetrySeconds) {
+        return false;
+    }
+
+    binding.lastResolveAttemptAt = now;
+    binding.command = XPLMFindCommand(binding.commandPath.c_str());
+    if (binding.command == nullptr) {
+        return false;
+    }
+
+    ++g_resolvedBindings;
+    logInfo("dispatch", "Resolved binding at runtime: " + bindingSummary(binding));
+    return true;
 }
 
 void loadProfile() {
@@ -1435,7 +1459,7 @@ void reloadRuntimeConfig() {
 }
 
 void dispatchBinding(ActionBinding& binding, bool pressed) {
-    if (binding.command == nullptr) {
+    if (binding.command == nullptr && !tryResolveBindingAtRuntime(binding)) {
         logWarn("dispatch", "Skipping unresolved binding: " + bindingSummary(binding));
         return;
     }
