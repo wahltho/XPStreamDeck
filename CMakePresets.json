@@ -1,0 +1,70 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release-base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "XPLANE_SDK_ROOT": "${sourceDir}/../../SDKs/XPlane_SDK"
+      }
+    },
+    {
+      "name": "mac-release",
+      "inherits": "release-base",
+      "description": "macOS release build under $HOME/dev/XPStreamDesk/build-mac",
+      "binaryDir": "$env{HOME}/dev/XPStreamDesk/build-mac"
+    },
+    {
+      "name": "mac-universal-release",
+      "inherits": "release-base",
+      "description": "macOS universal release build under $HOME/dev/XPStreamDesk/build-mac-universal",
+      "binaryDir": "$env{HOME}/dev/XPStreamDesk/build-mac-universal",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "x86_64;arm64"
+      }
+    },
+    {
+      "name": "linux-release",
+      "inherits": "release-base",
+      "description": "Native Linux release build under $HOME/dev/XPStreamDesk/build-lin",
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/dev/XPStreamDesk/build-lin"
+    },
+    {
+      "name": "win-mingw-release",
+      "inherits": "release-base",
+      "description": "MinGW cross-build under $HOME/dev/XPStreamDesk/build-win",
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/dev/XPStreamDesk/build-win",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_C_COMPILER": "x86_64-w64-mingw32-gcc",
+        "CMAKE_CXX_COMPILER": "x86_64-w64-mingw32-g++"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mac-release",
+      "configurePreset": "mac-release"
+    },
+    {
+      "name": "mac-universal-release",
+      "configurePreset": "mac-universal-release"
+    },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release"
+    },
+    {
+      "name": "win-mingw-release",
+      "configurePreset": "win-mingw-release"
+    }
+  ]
+}

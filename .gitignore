@@ -16,6 +16,7 @@ build-*/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
+CMakeUserPresets.json
 Testing/
 compile_commands.json
 cmake_install.cmake

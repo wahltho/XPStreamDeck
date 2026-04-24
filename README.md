@@ -128,6 +128,7 @@ Expected X-Plane layout:
 
 ## Build
 See `BUILD.md`.
+The checked-in build flow now places CMake build trees under `/Users/wahltho/dev/XPStreamDesk` so the iCloud-synced source checkout does not absorb build traffic.
 
 ## Next Steps
 - Add state-driven key styles and active/inactive feedback.
